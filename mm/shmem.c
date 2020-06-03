@@ -1598,7 +1598,7 @@ static int shmem_replace_page(struct page **pagep, gfp_t gfp,
 		oldpage = newpage;
 	} else {
 		mem_cgroup_migrate(oldpage, newpage);
-		lru_cache_add_anon(newpage);
+		lru_cache_add(newpage);
 		*pagep = newpage;
 	}
 
@@ -1885,7 +1885,7 @@ alloc_nohuge:
 	}
 	mem_cgroup_commit_charge(page, memcg, false,
 				 PageTransHuge(page));
-	lru_cache_add_anon(page);
+	lru_cache_add(page);
 
 	spin_lock_irq(&info->lock);
 	info->alloced += 1 << compound_order(page);
