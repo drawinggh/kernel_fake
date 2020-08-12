@@ -76,7 +76,7 @@ int mfill_atomic_install_pte(struct mm_struct *dst_mm, pmd_t *dst_pmd,
 	inc_mm_counter(dst_mm, mm_counter(page));
 
 	if (newly_allocated)
-		lru_cache_add_active_or_unevictable(page, dst_vma);
+		lru_cache_add_inactive_or_unevictable(page, dst_vma);
 
 	set_pte_at(dst_mm, dst_addr, dst_pte, _dst_pte);
 
