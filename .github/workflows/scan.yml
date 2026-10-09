@@ -1,0 +1,111 @@
+name: scan-two-dirs
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Branch name to scan (required, the branch your kernel is built from)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout selected branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch }}
+          path: src
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Scan
+        shell: bash {0}
+        run: |
+          export TZ=UTC LC_ALL=C
+          mkdir -p report
+          OUT="$PWD/report/scan2.txt"
+          cd src || exit 0
+          D1=drivers/power/supply/cas_qcom
+          D2=drivers/power/supply/qcom_cas
+
+          {
+            echo "# scan two dirs"
+            echo "time_utc: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "commit: $(git rev-parse --short HEAD 2>/dev/null)"
+
+            echo; echo "## A. Makefile / Kconfig references"
+            grep -nE "step-chg-jeita|cas_qcom|qcom_cas" drivers/power/supply/Makefile 2>/dev/null | cut -c1-200
+            grep -rnE "cas_qcom|qcom_cas" drivers/power/supply/Kconfig 2>/dev/null | cut -c1-200
+
+            echo; echo "## B. DTS values in this branch"
+            grep -nE "chg-warm-th|chg-cool-th|battery-warm-th|therm-level-threshold" \
+              arch/arm64/boot/dts/vendor/qcom/alioth-sm8250.dtsi 2>/dev/null | cut -c1-160
+            grep -nE "jeita-warm-th|jeita-cool-th" \
+              arch/arm64/boot/dts/vendor/qcom/fg-gen4-batterydata-alioth-*.dtsi \
+              arch/arm64/boot/dts/vendor/qcom/fg-gen4-batterydata-apollo-*.dtsi 2>/dev/null | sed 's#^.*/##' | cut -c1-160
+
+            for D in "$D1" "$D2"; do
+              F="$D/step-chg-jeita.c"
+              H="$D/step-chg-jeita.h"
+              echo; echo "=============================="
+              echo "## DIR: $D"
+              if [ ! -f "$F" ]; then echo "(step-chg-jeita.c missing)"; continue; fi
+
+              echo; echo "### header thresholds"
+              grep -nE "BATT_(WARM|COOL)_THRESHOLD|BATT_COOL_INDEX" "$H" 2>/dev/null
+
+              echo; echo "### hysteresis assignments"
+              grep -nE "hysteresis *=" "$F" | cut -c1-160
+
+              echo; echo "### warm/cool threshold usage"
+              grep -nE "jeita_(warm|cool|hot|cold)_th" "$F" | cut -c1-180
+
+              echo; echo "### fast charge function (full)"
+              start=$(grep -nE "^static int handle_fast_charge" "$F" | head -n1 | cut -d: -f1)
+              if [ -n "$start" ]; then
+                sed -n "${start},$((start+75))p" "$F" | cut -c1-180
+              else
+                echo "(not found)"
+              fi
+
+              echo; echo "### ffc_mode_dis block"
+              ln=$(grep -nE "ffc_mode_dis" "$F" | head -n1 | cut -d: -f1)
+              if [ -n "$ln" ]; then
+                sed -n "$((ln-6)),$((ln+22))p" "$F" | cut -c1-180
+              else
+                echo "(not found)"
+              fi
+
+              echo; echo "### jeita temp handling block (hysteresis 5 vs 20)"
+              ln=$(grep -nE "param.hysteresis = 5;" "$F" | head -n1 | cut -d: -f1)
+              if [ -n "$ln" ]; then
+                sed -n "$((ln-10)),$((ln+30))p" "$F" | cut -c1-180
+              else
+                echo "(not found)"
+              fi
+
+              echo; echo "### debug print strings"
+              grep -nE "fastcharge mode|QCOM-STEPCHG|pr_fmt" "$F" | cut -c1-160
+            done
+
+            echo; echo "# end"
+          } > "$OUT" 2>&1
+
+          # privacy: strip URLs and emails
+          sed -E -i 's#https?://[^ )"]+#<url>#g; s#[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+#<email>#g' "$OUT"
+          echo "lines: $(wc -l < "$OUT")"
+          exit 0
+
+      - name: Upload report
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan2-report
+          path: report/scan2.txt
+          retention-days: 7
+          if-no-files-found: error
