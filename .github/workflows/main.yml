@@ -1,0 +1,497 @@
+name: FD-release-alioth-builder
+
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      KERNEL_TREE_1:
+        description: 'Kernel Tree'
+        default: 'https://github.com/re-noroi/kernel_sm8250'
+        required: true
+      KERNEL_TREE_BRANCH_1:
+        description: 'Kernel Tree Branch 1'
+        default: 'bpf-staging'
+        required: true
+      CODENAME:
+        description: 'Codename (do not change)'
+        default: 'alioth'
+        required: true
+      ANYKERNEL_URL:
+        description: 'AnyKernel Url (leave blank if you dont want AnyKernel)'
+        default: 'https://github.com/re-noroi/anykernel3-test'
+        required: false
+      CUSTOM_SED:
+        description: 'Custom Kernel Version'
+        default: '-SnowFall'
+        required: false
+      COMPILER:
+        description: 'Choose compiler'
+        required: true
+        type: choice
+        options:
+          - neutron
+          - r547379
+          - r574158
+          - r614150
+        default: neutron
+      VARIANT:
+        description: '-W is only for rename'
+        required: true
+        type: choice
+        options:
+          - stock
+          - W-variant
+          - oplus-variant
+        default: W-variant
+      LTO_CHOICE:
+        required: true
+        type: choice
+        options:
+          - full_lto
+          - thin_lto
+        default: full_lto
+      REMOVE_CYCLE_COUNT:
+        description: 'Remove cycle count'
+        required: true
+        type: choice
+        options:
+          - 'no'
+          - 'yes'
+        default: 'no'
+      ENABLE_NTSYNC:
+        description: '[Extra] Enable NT synchronization (NTSYNC)'
+        required: false
+        type: boolean
+        default: false
+      ENABLE_NOMOUNT:
+        description: '[Extra] Enable NoMount support (NOMOUNT)'
+        required: false
+        type: boolean
+        default: true
+      ENABLE_RW_SWAPPINESS:
+        description: '[Extra] Allow modification of swappiness'
+        required: false
+        type: boolean
+        default: true
+      ENABLE_BYPASS_CHARGING:
+        description: '[Extra] Enable bypass charging'
+        required: false
+        type: boolean
+        default: true
+      ENABLE_BASEBAND_GUARD:
+        description: '[Extra] Enable Baseband-guard (Anti-Format)'
+        required: false
+        type: boolean
+        default: true
+
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        kernel: [1, 2, 3, 4]
+    runs-on: ubuntu-latest
+    env:
+      UPLOAD_TO_RELEASE: false
+
+    steps:
+      - name: Checkout Workflow Repository
+        uses: actions/checkout@v4
+
+      - name: Install Dependencies
+        run: sudo apt install flex libncurses6 gnupg
+
+      - name: Download & Extract Clang
+        run: |
+          if [[ "${{ github.event.inputs.COMPILER }}" == "r547379" ]]; then
+            wget https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r547379.tar.gz -O clang.tar.gz
+            mkdir clang
+            tar -xf clang.tar.gz -C clang
+          elif [[ "${{ github.event.inputs.COMPILER }}" == "r574158" ]]; then
+            wget https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/ebcc6c3bef363bc539ea39f45b6abae1dce6ff1a/clang-r574158.tar.gz -O clang.tar.gz
+            mkdir clang
+            tar -xf clang.tar.gz -C clang
+          elif [[ "${{ github.event.inputs.COMPILER }}" == "r614150" ]]; then
+            wget https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/c66f8b376703f420d791cf01547d076649651aa8/clang-r614150.tar.gz -O clang.tar.gz
+            mkdir clang
+            tar -xf clang.tar.gz -C clang
+          else
+            wget https://github.com/Neutron-Toolchains/clang-build-catalogue/releases/download/06092026/neutron-clang-06092026.tar.zst -O clang.tar.zst
+            mkdir clang
+            unzstd -d clang.tar.zst
+            tar -xf clang.tar -C clang
+          fi
+          
+      - name: Set Kernel Environment Variables
+        run: |
+          echo "KERNEL_TREE_BRANCH=${{ github.event.inputs.KERNEL_TREE_BRANCH_1 }}" >> $GITHUB_ENV
+      - name: Checkout Kernel via PAT
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          if [[ "${{ github.event.inputs.KERNEL_TREE_1 }}" == "private" ]]; then
+            REPO_URL="https://x-access-token:${GH_PAT}@github.com/re-noroi/FD-private.git"
+          else
+            REPO_URL="${{ github.event.inputs.KERNEL_TREE_1 }}"
+          fi
+          TARGET_BRANCH="${{ env.KERNEL_TREE_BRANCH }}"
+          if [[ "$TARGET_BRANCH" == "16" ]]; then
+            TARGET_BRANCH="stable-1.6"
+          fi
+          git clone --depth=1 --branch "$TARGET_BRANCH" "${REPO_URL}" kernel_tree
+
+      - name: Setup Baseband-guard
+        if: ${{ github.event.inputs.ENABLE_BASEBAND_GUARD == 'true' }}
+        run: |
+          cd kernel_tree
+          echo "==========================================="
+          echo " [*] Initializing Baseband-guard Setup"
+          echo "==========================================="
+          echo "[*] Downloading and running Baseband-guard remote setup script..."
+          wget -O- https://github.com/vc-teahouse/Baseband-guard/raw/main/setup.sh | bash || true
+
+          echo "[*] Configuring Baseband-guard for Linux 4.19 compatibility..."
+          sed -i 's/HAS_DEFINE_LSM := .*/HAS_DEFINE_LSM := false/' Baseband-guard/Makefile
+          sed -i 's/security_initcall(bbg_init);/late_initcall(bbg_init);/' Baseband-guard/baseband_guard.c
+          sed -i '/static inline struct task_security_struct \*selinux_cred/,+3d' Baseband-guard/tracing/tracing.c
+          sed -i '/#include "avc.h"/a #ifndef BBG_USE_DEFINE_LSM\n#include "bbg_tracing.h"\n#endif' security/selinux/include/objsec.h
+          sed -i '/u32 sockcreate_sid[;]*/a #ifndef BBG_USE_DEFINE_LSM\n\tstruct bbg_cred_security_struct  bbg_cred; /* bbg cred security */\n#endif' security/selinux/include/objsec.h
+          cp -f Baseband-guard/tracing/tracing.h security/selinux/include/bbg_tracing.h
+          cp -f Baseband-guard/tracing/tracing.h security/selinux/bbg_tracing.h
+
+          echo "[*] Patching whitelist in baseband_guard.c..."
+          sed -i 's|return deny("write to protected partition", file, inode, 0);|if (file \&\& file->f_path.dentry \&\& (strstr(file->f_path.dentry->d_name.name, "sdg") \|\| strstr(file->f_path.dentry->d_name.name, "sdh") \|\| strstr(file->f_path.dentry->d_name.name, "sdi") \|\| strstr(file->f_path.dentry->d_name.name, "mapper") \|\| strstr(file->f_path.dentry->d_name.name, "dm-") \|\| strstr(file->f_path.dentry->d_name.name, "vold"))) return 0;\n\treturn deny("write to protected partition", file, inode, 0);|g' Baseband-guard/baseband_guard.c
+          sed -i 's|return deny("setattr on protected partition", 0, inode, 0);|if (dentry \&\& (strstr(dentry->d_name.name, "sdg") \|\| strstr(dentry->d_name.name, "sdh") \|\| strstr(dentry->d_name.name, "sdi") \|\| strstr(dentry->d_name.name, "mapper") \|\| strstr(dentry->d_name.name, "dm-") \|\| strstr(dentry->d_name.name, "vold"))) return 0;\n\treturn deny("setattr on protected partition", 0, inode, 0);|g' Baseband-guard/baseband_guard.c
+          sed -i 's|return deny("destructive ioctl on protected partition", file, inode, cmd);|if (file \&\& file->f_path.dentry \&\& (strstr(file->f_path.dentry->d_name.name, "sdg") \|\| strstr(file->f_path.dentry->d_name.name, "sdh") \|\| strstr(file->f_path.dentry->d_name.name, "sdi") \|\| strstr(file->f_path.dentry->d_name.name, "mapper") \|\| strstr(file->f_path.dentry->d_name.name, "dm-") \|\| strstr(file->f_path.dentry->d_name.name, "vold"))) return 0;\n\treturn deny("destructive ioctl on protected partition", file, inode, cmd);|g' Baseband-guard/baseband_guard.c
+
+          echo "[+] DONE! Whitelisted: sdg, sdh, sdi, mapper, dm-, vold. Baseband is fully protected."
+          echo "==========================================="
+
+      - name: Restore 300MHz Minimum CPU Frequency
+        run: |
+          cd kernel_tree
+          python3 -c '
+          file = "arch/arm64/boot/dts/vendor/qcom/kona.dtsi"
+          with open(file, "r") as f:
+              c = f.read()
+          target = "\tqcom,cpufreq-table-0 =\n\t\t\t<1171200>,"
+          replacement = "\tqcom,cpufreq-table-0 =\n\t\t\t< 300000>,\n\t\t\t< 518400>,\n\t\t\t< 614400>,\n\t\t\t< 691200>,\n\t\t\t< 787200>,\n\t\t\t< 883200>,\n\t\t\t< 979200>,\n\t\t\t<1075200>,\n\t\t\t<1171200>,"
+          if target in c:
+              c = c.replace(target, replacement, 1)
+              with open(file, "w") as f:
+                  f.write(c)
+              print("[+] Successfully restored 300MHz minimum CPU frequency for cluster 0")
+          '
+
+      - name: Kernel Version
+        run: |
+          cd kernel_tree
+          EXTRA=""
+          if [[ "${{ github.event.inputs.VARIANT }}" == "oplus-variant" ]]; then
+            EXTRA="-oplus"
+          fi
+          sed -i -e "s/CONFIG_LOCALVERSION=\"-FakeDreamer\"/CONFIG_LOCALVERSION=\"${{ github.event.inputs.CUSTOM_SED }}${EXTRA}\"/" arch/arm64/configs/vendor/alioth_defconfig
+
+      - name: Remove cycle count
+        if: ${{ github.event.inputs.REMOVE_CYCLE_COUNT == 'yes' }}
+        run: |
+          cd kernel_tree
+          sed -i '/case POWER_SUPPLY_PROP_CYCLE_COUNT:/,/break;/c\
+          \tcase POWER_SUPPLY_PROP_CYCLE_COUNT:\
+          \t#ifdef CONFIG_BATT_VERIFY_BY_DS28E16\
+          \t\tpval->intval = fg->maxim_cycle_count;\
+          \t#else\
+          \t\trc = get_cycle_count(chip->counter, &pval->intval);\
+          \t#endif\
+          \t\tbreak;' drivers/power/supply/qcom/qpnp-fg-gen4.c
+
+      - name: Remove KSU (Apply only for kernel 2)
+        if: matrix.kernel == 2
+        run: |
+          cd kernel_tree
+          sed -i -e '/CONFIG_KSU=y/c\# CONFIG_KSU is not set;' arch/arm64/configs/vendor/alioth_defconfig
+          sed -i -e '/CONFIG_KSU_TAMPER_SYSCALL_TABLE=y/c\# CONFIG_KSU_TAMPER_SYSCALL_TABLE is not set;' arch/arm64/configs/vendor/alioth_defconfig
+          sed -i -e '/CONFIG_KSU_FEATURE_SULOG=y/c\# CONFIG_KSU_FEATURE_SULOG is not set;' arch/arm64/configs/vendor/alioth_defconfig
+          sed -i -e '/CONFIG_KSU_FEATURE_ADBROOT=y/c\# CONFIG_KSU_FEATURE_ADBROOT is not set;' arch/arm64/configs/vendor/alioth_defconfig
+          sed -i -e '/CONFIG_KSU_LSM_SECURITY_HOOKS=y/c\# CONFIG_KSU_LSM_SECURITY_HOOKS is not set;' arch/arm64/configs/vendor/alioth_defconfig
+          sed -i -e '/CONFIG_KSU_HEURISTIC_IN_TREE_BUILD=y/c\# CONFIG_KSU_HEURISTIC_IN_TREE_BUILD is not set;' arch/arm64/configs/vendor/alioth_defconfig
+
+      - name: Change different battery type
+        if: matrix.kernel == 3 || matrix.kernel == 4
+        run: |
+          cd kernel_tree
+          sed -i -e '/qcom,j3s-batt-profile;/d' arch/arm64/boot/dts/vendor/qcom/alioth-sm8250.dtsi
+          sed -i -e '/fg-gen4-batterydata-apollo-sun-5000mah.dtsi/d' arch/arm64/boot/dts/vendor/qcom/alioth-sm8250.dtsi
+
+      - name: Revert to stock gpufreq
+        if: matrix.kernel == 3 || matrix.kernel == 4
+        run: |
+          cd kernel_tree
+          patch -p1 -f < "0001-stock-gpu-freq.patch"
+
+      - name: Disable MLGO flags for Neutron Clang
+        if: ${{ github.event.inputs.COMPILER == 'neutron' }}
+        run: |
+          cd kernel_tree
+          sed -i -e '/regalloc-enable-advisor/s/^/#/' -e '/enable-ml-inliner/s/^/#/' Makefile
+
+      - name: Fix QSEECOM Clang Warning
+        run: |
+          cd kernel_tree
+          [ -f "drivers/misc/qseecom.c" ] && sed -i 's/DMA_BIT_MASK(32)/(u32)DMA_BIT_MASK(32)/g' drivers/misc/qseecom.c
+          [ -f "drivers/misc/Makefile" ] && echo "CFLAGS_qseecom.o += -Wno-error -Wno-constant-conversion -Wno-shift-count-overflow" >> drivers/misc/Makefile
+
+      - name: Change LTO Type
+        if: ${{ github.event.inputs.LTO_CHOICE == 'thin_lto' }}
+        run: |
+          cd kernel_tree
+          sed -i -e '/# CONFIG_LTO_CLANG_THIN is not set/c\CONFIG_LTO_CLANG_THIN=y;' arch/arm64/configs/vendor/alioth_defconfig
+          sed -i -e '/CONFIG_LTO_CLANG_FULL=y/c\# CONFIG_LTO_CLANG_FULL is not set;' arch/arm64/configs/vendor/alioth_defconfig
+
+      - name: Oplus Features
+        if: ${{ github.event.inputs.VARIANT == 'oplus-variant' }}
+        run: |
+          cd kernel_tree
+          sed -i -e '/# CONFIG_OPLUS_PORT is not set/c\CONFIG_OPLUS_PORT=y;' arch/arm64/configs/vendor/alioth_defconfig
+
+      - name: Apply Custom Feature Switches
+        run: |
+          cd kernel_tree
+          DEFCONFIG="arch/arm64/configs/vendor/alioth_defconfig"
+          
+          chmod +x ./scripts/config
+          # Function to toggle configs and echo the status
+          toggle_config() {
+            local feature=$1
+            local state=$2
+            
+            if [[ "$state" == 'true' ]]; then
+              echo "  [+] Enabling $feature"
+              ./scripts/config --file $DEFCONFIG --enable "$feature"
+            else
+              echo "  [-] Disabling $feature"
+              ./scripts/config --file $DEFCONFIG --disable "$feature"
+            fi
+          }
+
+          echo "==== Applying Extra Features ===="
+          toggle_config "CONFIG_NTSYNC" "${{ github.event.inputs.ENABLE_NTSYNC }}"
+          toggle_config "CONFIG_NOMOUNT" "${{ github.event.inputs.ENABLE_NOMOUNT }}"
+          toggle_config "CONFIG_RW_SWAPPINESS" "${{ github.event.inputs.ENABLE_RW_SWAPPINESS }}"
+          toggle_config "CONFIG_BYPASS_CHARGING" "${{ github.event.inputs.ENABLE_BYPASS_CHARGING }}"
+
+          echo "  [+] Setting Deadline I/O scheduler (Permanent)"
+          ./scripts/config --file $DEFCONFIG --enable "CONFIG_IOSCHED_DEADLINE"
+          ./scripts/config --file $DEFCONFIG --enable "CONFIG_DEFAULT_DEADLINE"
+          ./scripts/config --file $DEFCONFIG --disable "CONFIG_DEFAULT_CFQ"
+          ./scripts/config --file $DEFCONFIG --set-str CONFIG_DEFAULT_IOSCHED "deadline"
+          ./scripts/config --file $DEFCONFIG --enable "CONFIG_MQ_IOSCHED_DEADLINE"
+
+          if [[ "${{ github.event.inputs.ENABLE_BASEBAND_GUARD }}" == "true" ]]; then
+            echo "  [+] Enabling Baseband-guard in defconfig"
+            ./scripts/config --file $DEFCONFIG --enable "CONFIG_BBG"
+            sed -i '/CONFIG_LSM=/ { /baseband_guard/! s/"$/,baseband_guard"/ }' $DEFCONFIG || true
+          fi
+          echo "================================="
+
+      - name: Apply Modifications (if modified build)
+        if: matrix.kernel == 2 || matrix.kernel == 4
+        run: |
+          cd kernel_tree
+          sed -i -e '/<2553600>,/c\<2553600>;' arch/arm64/boot/dts/vendor/qcom/kona.dtsi
+          sed -i -e '/<2649600>,/c\//<2649600>,' arch/arm64/boot/dts/vendor/qcom/kona.dtsi
+          sed -i -e '/<2745600>,/c\//<2745600>,' arch/arm64/boot/dts/vendor/qcom/kona.dtsi
+          sed -i -e '/<2841600>,/c\//<2841600>,' arch/arm64/boot/dts/vendor/qcom/kona.dtsi
+          sed -i -e '/<3187200>;/c\//<3187200>;' arch/arm64/boot/dts/vendor/qcom/kona.dtsi
+          sed -i -e 's/qcom,mdss-pan-physical-width-dimension = <70>;/qcom,mdss-pan-physical-width-dimension = <695>;/' arch/arm64/boot/dts/vendor/qcom/dsi-panel-k11a-38-08-0a-dsc-cmd.dtsi
+          sed -i -e 's/qcom,mdss-pan-physical-height-dimension = <155>;/qcom,mdss-pan-physical-height-dimension = <1546>;/' arch/arm64/boot/dts/vendor/qcom/dsi-panel-k11a-38-08-0a-dsc-cmd.dtsi
+      
+      - name: Build Kernel
+        run: |
+          export PATH="$(pwd)/clang/bin:$PATH"
+          export ARCH=arm64
+          export SUBARCH=ARM64
+          export KBUILD_BUILD_USER="renoroi"
+          export KBUILD_BUILD_HOST="dreamstate"
+          export KBUILD_BUILD_TIMESTAMP="$(TZ=UTC-7 date)"
+          cd kernel_tree
+          make O=out vendor/alioth_defconfig
+
+          # ==============================================================
+          # GPG Encrypted Config Decryption & Execution
+          # ==============================================================
+          PASSPHRASE="${{ secrets.GPG_PASSWORD }}"
+          
+          if [ -n "$PASSPHRASE" ]; then
+            echo "::add-mask::$PASSPHRASE"
+          fi
+
+          ENCRYPTED_FILE="$GITHUB_WORKSPACE/config.sh.gpg"
+          if [ -f "$ENCRYPTED_FILE" ]; then
+            if [ -z "$PASSPHRASE" ]; then
+              echo "[!] Error: Encrypted file config.sh.gpg detected but no password provided!"
+              exit 1
+            fi
+
+            echo "[*] Decrypting config.sh.gpg..."
+            gpg --batch --yes --quiet --passphrase "$PASSPHRASE" --output config_decrypted.sh --decrypt "$ENCRYPTED_FILE"
+
+            if [ -s config_decrypted.sh ]; then
+              echo "[+] Decryption successful! Executing custom tweaks..."
+              chmod +x config_decrypted.sh
+              export OUT_DIR="out"
+              chmod +x scripts/config
+              ./config_decrypted.sh
+              
+              rm -f config_decrypted.sh
+              echo "[+] Custom script executed and securely shredded from runner."
+
+              echo "[*] Ensuring Deadline I/O scheduler is set..."
+              ./scripts/config --file out/.config --enable CONFIG_IOSCHED_DEADLINE
+              ./scripts/config --file out/.config --enable CONFIG_DEFAULT_DEADLINE
+              ./scripts/config --file out/.config --disable CONFIG_DEFAULT_CFQ
+              ./scripts/config --file out/.config --set-str CONFIG_DEFAULT_IOSCHED "deadline"
+              ./scripts/config --file out/.config --enable CONFIG_MQ_IOSCHED_DEADLINE
+
+              echo "[*] Refreshing config dependencies..."
+              make O=out CC=clang CROSS_COMPILE=aarch64-linux-gnu- LLVM=1 LLVM_IAS=1 olddefconfig
+            else
+              echo "[!] Decryption failed: Incorrect password or corrupted file!"
+              exit 1
+            fi
+          else
+            echo "[i] config.sh.gpg not found in repository root. Proceeding with standard build."
+          fi
+          # ==============================================================
+
+          make O=out CC=clang -j$(nproc --all) CROSS_COMPILE=aarch64-linux-gnu- LLVM=1 LLVM_IAS=1
+          if [[ "${{ matrix.kernel }}" == 1 ]]; then
+            cp out/arch/arm64/boot/Image.gz ../Image.gz
+            mv out/arch/arm64/boot/dtbo.img ../alioth-j3s-dtbo-aosp.img
+            mv out/arch/arm64/boot/dtb.img ../alioth-normal-dtb
+          elif [[ "${{ matrix.kernel }}" == 2 ]]; then
+            cp out/arch/arm64/boot/Image.gz ../Image.gz
+            mv out/arch/arm64/boot/dtbo.img ../alioth-j3s-dtbo-miui.img
+            mv out/arch/arm64/boot/dtb.img ../alioth-effcpu-dtb
+          elif [[ "${{ matrix.kernel }}" == 3 ]]; then
+            mv out/arch/arm64/boot/dtb.img ../alioth-normal-gpustk-dtb
+            mv out/arch/arm64/boot/dtbo.img ../alioth-stock-dtbo-aosp.img
+          else
+            mv out/arch/arm64/boot/dtb.img ../alioth-effcpu-gpustk-dtb
+            mv out/arch/arm64/boot/dtbo.img ../alioth-stock-dtbo-miui.img
+          fi
+
+      - name: Upload Kernel Artifacts
+        uses: actions/upload-artifact@v4
+        if: matrix.kernel == 1 || matrix.kernel == 2
+        with:
+          name: kernel-${{ matrix.kernel }}-base
+          path: |
+            Image.gz
+
+      - name: Upload Kernel Artifacts
+        uses: actions/upload-artifact@v4
+        if: matrix.kernel == 1
+        with:
+          name: kernel-part-${{ matrix.kernel }}-addon
+          path: |
+            alioth-j3s-dtbo-aosp.img
+            alioth-normal-dtb
+
+      - name: Upload Kernel Artifacts
+        uses: actions/upload-artifact@v4
+        if: matrix.kernel == 2
+        with:
+          name: kernel-part-${{ matrix.kernel }}-addon
+          path: |
+            alioth-j3s-dtbo-miui.img
+            alioth-effcpu-dtb
+      - name: Upload Kernel Artifacts
+        uses: actions/upload-artifact@v4
+        if: matrix.kernel == 3
+        with:
+          name: kernel-part-${{ matrix.kernel }}-addon
+          path: |
+            alioth-stock-dtbo-aosp.img
+            alioth-normal-gpustk-dtb
+
+      - name: Upload Kernel Artifacts
+        uses: actions/upload-artifact@v4
+        if: matrix.kernel == 4
+        with:
+          name: kernel-part-${{ matrix.kernel }}-addon
+          path: |
+            alioth-stock-dtbo-miui.img
+            alioth-effcpu-gpustk-dtb
+
+  package_anykernel:
+    needs: build
+    strategy:
+      matrix:
+        kernel: [1, 2]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download Kernel Build Image
+        uses: actions/download-artifact@v4
+        with:
+          name: kernel-${{ matrix.kernel }}-base
+          path: kernel-${{ matrix.kernel }}-base
+
+      - name: Download Kernel Build Addon 1
+        uses: actions/download-artifact@v4
+        with:
+          name: kernel-part-1-addon
+          path: kernel-part-1-addon
+
+      - name: Download Kernel Build Addon 2
+        uses: actions/download-artifact@v4
+        with:
+          name: kernel-part-2-addon
+          path: kernel-part-2-addon
+
+      - name: Download Kernel Build Addon 3
+        uses: actions/download-artifact@v4
+        with:
+          name: kernel-part-3-addon
+          path: kernel-part-3-addon
+
+      - name: Download Kernel Build Addon 4
+        uses: actions/download-artifact@v4
+        with:
+          name: kernel-part-4-addon
+          path: kernel-part-4-addon
+
+      - name: Clone AnyKernel3
+        run: git clone --recursive --depth=1 ${{ github.event.inputs.ANYKERNEL_URL }} -b main AnyKernel3-${{ matrix.kernel }}
+
+      - name: Move Kernel Files to AnyKernel3
+        run: |
+          mv kernel-${{ matrix.kernel }}-base/* AnyKernel3-${{ matrix.kernel }}/
+          mv kernel-part-1-addon/* AnyKernel3-${{ matrix.kernel }}/
+          mv kernel-part-2-addon/* AnyKernel3-${{ matrix.kernel }}/
+          mv kernel-part-3-addon/* AnyKernel3-${{ matrix.kernel }}/
+          mv kernel-part-4-addon/* AnyKernel3-${{ matrix.kernel }}/
+
+      - name: Define ZIP Name
+        run: |
+          COMPILED_DATE=$(date +%Y%m%d)
+          EXTRA2=""
+          if [[ "${{ github.event.inputs.VARIANT }}" == "oplus-variant" ]]; then
+            EXTRA2="-OPLUS"
+          fi
+          if [[ "${{ matrix.kernel }}" == "1" ]]; then
+            echo "ZIP_NAME=[FD-][ksu-${{ github.event.inputs.CODENAME }}-${COMPILED_DATE}${EXTRA2}]" >> $GITHUB_ENV
+          else
+            echo "ZIP_NAME=[FD-][noksu-${{ github.event.inputs.CODENAME }}-${COMPILED_DATE}${EXTRA2}]" >> $GITHUB_ENV
+          fi
+      
+      - name: Upload Flashable Kernel Zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ZIP_NAME }}
+          path: |
+            AnyKernel3-${{ matrix.kernel }}/
+            !AnyKernel3-${{ matrix.kernel }}/.git
+            !AnyKernel3-${{ matrix.kernel }}/.github
+            
