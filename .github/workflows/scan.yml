@@ -1,4 +1,4 @@
-name: scan-two-dirs
+name: scan-charge-root-cause
 
 on:
   workflow_dispatch:
@@ -14,7 +14,7 @@ permissions:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - name: Checkout selected branch
         uses: actions/checkout@v4
@@ -29,83 +29,128 @@ jobs:
         run: |
           export TZ=UTC LC_ALL=C
           mkdir -p report
-          OUT="$PWD/report/scan2.txt"
+          OUT="$PWD/report/scan3.txt"
           cd src || exit 0
-          D1=drivers/power/supply/cas_qcom
-          D2=drivers/power/supply/qcom_cas
+
+          S=drivers/power/supply
+          CAS=$S/qcom_cas
+          TI=$S/ti
+          DT=arch/arm64/boot/dts/vendor/qcom
+          INC=(--include='*.c' --include='*.h')
+
+          sec() { echo; echo "### $1"; }
+
+          # grep lines: title, pattern, max lines, paths...
+          g() {
+            local title="$1" pat="$2" max="$3"; shift 3
+            local res n
+            sec "$title"
+            res=$(grep -rnHE "${INC[@]}" -e "$pat" "$@" 2>/dev/null | cut -c1-200)
+            n=$(printf '%s\n' "$res" | grep -c .)
+            if [ "${n:-0}" -eq 0 ]; then echo "(no matches)"; return 0; fi
+            printf '%s\n' "$res" | head -n "$max"
+            [ "$n" -gt "$max" ] && echo "... truncated: $n total, showing $max"
+            return 0
+          }
+
+          # first N matches with surrounding code: title, pattern, N, before, after, paths...
+          ctx() {
+            local title="$1" pat="$2" n="$3" b="$4" a="$5"; shift 5
+            local m f l s
+            sec "$title"
+            m=$(grep -rnHE "${INC[@]}" -e "$pat" "$@" 2>/dev/null | head -n "$n")
+            if [ -z "$m" ]; then echo "(no matches)"; return 0; fi
+            while IFS=: read -r f l _; do
+              [ -z "$f" ] && continue
+              s=$((l-b)); [ "$s" -lt 1 ] && s=1
+              echo "--- $f:$l"
+              sed -n "${s},$((l+a))p" "$f" | cut -c1-170
+            done <<< "$m"
+            return 0
+          }
 
           {
-            echo "# scan two dirs"
+            echo "# charge root cause scan"
             echo "time_utc: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
             echo "commit: $(git rev-parse --short HEAD 2>/dev/null)"
 
-            echo; echo "## A. Makefile / Kconfig references"
-            grep -nE "step-chg-jeita|cas_qcom|qcom_cas" drivers/power/supply/Makefile 2>/dev/null | cut -c1-200
-            grep -rnE "cas_qcom|qcom_cas" drivers/power/supply/Kconfig 2>/dev/null | cut -c1-200
+            echo; echo "## 1. What is actually compiled"
+            sec "supply Makefile lines for charger dirs"
+            grep -nE "qcom_cas|cas_qcom|/ti/|ti/|bq2597|bq27z|ln8000|pd_policy|cp_qc30" $S/Makefile 2>/dev/null | cut -c1-200
+            sec "ti Makefile"
+            cat $TI/Makefile 2>/dev/null | cut -c1-200
+            sec "qcom_cas Makefile"
+            cat $CAS/Makefile 2>/dev/null | cut -c1-200
+            sec "defconfig charge options (alioth)"
+            grep -nE "CONFIG_(BOARD_CAS|BQ|CP_|PD_|QPNP_SMB5|QPNP_QG|SMB1398|LN8000|CHARGER|BATTERY|STEP|JEITA|XIAOMI|MI_)[A-Z0-9_]*" \
+              arch/arm64/configs/vendor/alioth_defconfig 2>/dev/null | cut -c1-120
+            sec "ti files present"
+            ls $TI 2>/dev/null
 
-            echo; echo "## B. DTS values in this branch"
-            grep -nE "chg-warm-th|chg-cool-th|battery-warm-th|therm-level-threshold" \
-              arch/arm64/boot/dts/vendor/qcom/alioth-sm8250.dtsi 2>/dev/null | cut -c1-160
-            grep -nE "jeita-warm-th|jeita-cool-th" \
-              arch/arm64/boot/dts/vendor/qcom/fg-gen4-batterydata-alioth-*.dtsi \
-              arch/arm64/boot/dts/vendor/qcom/fg-gen4-batterydata-apollo-*.dtsi 2>/dev/null | sed 's#^.*/##' | cut -c1-160
+            echo; echo "## 2. Source of the dmesg strings seen on the phone"
+            ctx "batt_health print" 'batt_health\(' 2 14 6 drivers
+            ctx "cp_charge_enabled print" 'cp_charge_enabled' 1 6 6 drivers
+            ctx "fastcharge mode termi print" 'fastcharge mode:%d' 2 14 6 drivers
+            ctx "thermal_icl_ua print" 'thermal_icl_ua is' 1 8 6 drivers
+            sec "health enum values (what batt_health numbers mean)"
+            grep -nE "POWER_SUPPLY_HEALTH_[A-Z_]+" include/linux/power_supply.h 2>/dev/null | head -n 30
+            ctx "health enum definition" 'POWER_SUPPLY_HEALTH_UNKNOWN' 1 2 22 include/linux/power_supply.h
 
-            for D in "$D1" "$D2"; do
-              F="$D/step-chg-jeita.c"
-              H="$D/step-chg-jeita.h"
-              echo; echo "=============================="
-              echo "## DIR: $D"
-              if [ ! -f "$F" ]; then echo "(step-chg-jeita.c missing)"; continue; fi
+            echo; echo "## 3. Who sets health or disables charge by temperature"
+            g "HEALTH_WARM/HOT/OVERHEAT/COOL users (compiled dirs)" \
+              'POWER_SUPPLY_HEALTH_(WARM|HOT|OVERHEAT|COOL|COLD|CALIBRATION)' 80 $CAS $TI
+            g "chg_warm_threshold and soft jeita" \
+              'chg_warm_threshold|chg_cool_threshold|sw_jeita|soft_jeita|jeita_enabled' 60 $CAS
+            g "votes that disable fast charge or pump" \
+              'FFC_MODE_DIS|JEITA_VOTER|cp_disable_votable|pass_disable_votable|CP_DISABLE|FASTCHARGE_MODE' 90 $CAS
 
-              echo; echo "### header thresholds"
-              grep -nE "BATT_(WARM|COOL)_THRESHOLD|BATT_COOL_INDEX" "$H" 2>/dev/null
+            echo; echo "## 4. Temperature numbers in charger code (400-500 range)"
+            g "qcom_cas temp constants" \
+              '(temp|TEMP|THR|THRESH|warm|WARM|hot|HOT|cool|COOL)[^;]*[^0-9.](4[0-9]{2}|5[0-9]{2})([^0-9]|$)' 70 $CAS
+            g "ti temp constants" \
+              '(temp|TEMP|THR|THRESH|warm|WARM|hot|HOT|cool|COOL)[^;]*[^0-9.](4[0-9]{2}|5[0-9]{2})([^0-9]|$)' 70 $TI
+            g "ti temp related defines" \
+              '#define[[:space:]]+[A-Z0-9_]*(WARM|HOT|COOL|COLD|TEMP|THR|THERM)[A-Z0-9_]*' 60 $TI
 
-              echo; echo "### hysteresis assignments"
-              grep -nE "hysteresis *=" "$F" | cut -c1-160
+            echo; echo "## 5. Thermal level handling"
+            g "system_temp_level / thermal fcc,icl / therm level users" \
+              'system_temp_level|thermal_fcc_ua|thermal_icl_ua|therm_level|thermal_levels|MAX_THERMAL_LEVEL_FOR_CP|ICL_LIMIT_LEVEL_THR' 100 $CAS $TI
 
-              echo; echo "### warm/cool threshold usage"
-              grep -nE "jeita_(warm|cool|hot|cold)_th" "$F" | cut -c1-180
-
-              echo; echo "### fast charge function (full)"
-              start=$(grep -nE "^static int handle_fast_charge" "$F" | head -n1 | cut -d: -f1)
-              if [ -n "$start" ]; then
-                sed -n "${start},$((start+75))p" "$F" | cut -c1-180
-              else
-                echo "(not found)"
-              fi
-
-              echo; echo "### ffc_mode_dis block"
-              ln=$(grep -nE "ffc_mode_dis" "$F" | head -n1 | cut -d: -f1)
-              if [ -n "$ln" ]; then
-                sed -n "$((ln-6)),$((ln+22))p" "$F" | cut -c1-180
-              else
-                echo "(not found)"
-              fi
-
-              echo; echo "### jeita temp handling block (hysteresis 5 vs 20)"
-              ln=$(grep -nE "param.hysteresis = 5;" "$F" | head -n1 | cut -d: -f1)
-              if [ -n "$ln" ]; then
-                sed -n "$((ln-10)),$((ln+30))p" "$F" | cut -c1-180
-              else
-                echo "(not found)"
-              fi
-
-              echo; echo "### debug print strings"
-              grep -nE "fastcharge mode|QCOM-STEPCHG|pr_fmt" "$F" | cut -c1-160
+            echo; echo "## 6. Charge pump policy temperature logic (ti)"
+            for f in $(ls $TI/pd_policy_manager*.c 2>/dev/null); do
+              sec "$f"
+              grep -nE "temp|TEMP|warm|WARM|JEITA|therm|hot|HOT" "$f" | cut -c1-180 | head -n 70
             done
+            ctx "pd policy flash/warm hysteresis comment" 'add hysteresis for warm threshold' 1 8 16 $TI/pd_policy_manager.h
+
+            echo; echo "## 7. Pump / gauge driver temperature props"
+            g "bq2597x and bq27z561 temperature handling" \
+              'bat_therm|die_therm|bus_therm|TEMP_MAX|temp_max|fastcharge|FASTCHARGE' 60 \
+              $(ls $S/*bq2597* $TI/*bq2597* $CAS/bq27z561_fg.c 2>/dev/null)
+
+            echo; echo "## 8. DTS data"
+            for f in fg-gen4-batterydata-apollo-sun-5000mah.dtsi fg-gen4-batterydata-alioth-sun-5000mah.dtsi \
+                     fg-gen4-batterydata-alioth-FMT-4520mah.dtsi fg-gen4-batterydata-alioth-GY-4520mah.dtsi; do
+              sec "$f (first 32 lines)"
+              sed -n '1,32p' "$DT/$f" 2>/dev/null | cut -c1-120
+            done
+            sec "alioth-sm8250.dtsi charger-related properties"
+            grep -nE "therm-level|thermal-mitigation|warm-th|cool-th|use-bq|bq2597x,(bat|bus|die)|support-ffc|step-chg|sw-jeita|battery-warm" \
+              $DT/alioth-sm8250.dtsi 2>/dev/null | cut -c1-140
 
             echo; echo "# end"
           } > "$OUT" 2>&1
 
-          # privacy: strip URLs and emails
+          # privacy: strip URLs and emails, cap size
           sed -E -i 's#https?://[^ )"]+#<url>#g; s#[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+#<email>#g' "$OUT"
+          head -c 600000 "$OUT" > "$OUT.tmp" && mv "$OUT.tmp" "$OUT"
           echo "lines: $(wc -l < "$OUT")"
           exit 0
 
       - name: Upload report
         uses: actions/upload-artifact@v4
         with:
-          name: scan2-report
-          path: report/scan2.txt
+          name: scan3-report
+          path: report/scan3.txt
           retention-days: 7
           if-no-files-found: error
