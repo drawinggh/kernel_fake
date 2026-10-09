@@ -182,61 +182,7 @@ jobs:
                   f.write(c)
               print("[+] Successfully restored 300MHz minimum CPU frequency for cluster 0")
           '
-      - name: Patch charge thresholds (before build)
-        shell: bash {0}
-        env:
-          KERNEL_DIR: "."
-          WARM: "470"
-          BACK: "40"
-          PATCH_TI: "false"
-        run: |
-          cd "$KERNEL_DIR" || { echo "::warning::KERNEL_DIR not found"; exit 0; }
-          C=drivers/power/supply/qcom_cas/step-chg-jeita.c
-          Q=arch/arm64/boot/dts/vendor/qcom
-          fail=0
 
-          # 1) fast charge restart point: warm - BACK (47.0 -> restart below 43.0)
-          if [ -f "$C" ]; then
-            sed -i "s/chip->jeita_warm_th - chip->jeita_fv_config->param.hysteresis/chip->jeita_warm_th - ${BACK}/" "$C"
-            if ! grep -q "MYBUILD-v2" "$C"; then
-              printf '%s\n' '	pr_err("MYBUILD-v2: warm=%d temp=%d ffc_dis=%d\n", chip->jeita_warm_th, temp, ffc_mode_dis);' > /tmp/marker.txt
-              sed -i '/ffc_mode_dis = get_effective_result(chip->ffc_mode_dis_votable);/r /tmp/marker.txt' "$C"
-            fi
-            grep -q "jeita_warm_th - ${BACK}" "$C" && echo "OK  restart patch" || { echo "::warning::restart patch NOT applied"; fail=1; }
-            grep -q "MYBUILD-v2" "$C" && echo "OK  marker" || { echo "::warning::marker NOT added"; fail=1; }
-          else
-            echo "::warning::$C not found"; fail=1
-          fi
-
-          # 2) warm thresholds in DTS (all four battery profiles + main dtsi)
-          for f in fg-gen4-batterydata-apollo-sun-5000mah.dtsi \
-                   fg-gen4-batterydata-alioth-sun-5000mah.dtsi \
-                   fg-gen4-batterydata-alioth-FMT-4520mah.dtsi \
-                   fg-gen4-batterydata-alioth-GY-4520mah.dtsi; do
-            if [ -f "$Q/$f" ]; then
-              sed -i -E "s/(qcom,jeita-warm-th[[:space:]]*=[[:space:]]*<)[0-9]+(>)/\1${WARM}\2/" "$Q/$f"
-            else
-              echo "::warning::$f not found"
-            fi
-          done
-          if [ -f "$Q/alioth-sm8250.dtsi" ]; then
-            sed -i -E "s/(qcom,chg-warm-th[[:space:]]*=[[:space:]]*<)[0-9]+(>)/\1${WARM}\2/; s/(mi,qc3-battery-warm-th[[:space:]]*=[[:space:]]*<)[0-9]+(>)/\1${WARM}\2/; s/(mi,pd-battery-warm-th[[:space:]]*=[[:space:]]*<)[0-9]+(>)/\1${WARM}\2/" "$Q/alioth-sm8250.dtsi"
-          else
-            echo "::warning::alioth-sm8250.dtsi not found"
-          fi
-
-          # 3) optional: hardcoded 450 in charge pump headers (enable only if still throttling near 45)
-          if [ "$PATCH_TI" = "true" ]; then
-            for h in drivers/power/supply/ti/pd_policy_manager.h drivers/power/supply/ti/cp_qc30.h; do
-              [ -f "$h" ] && sed -i -E "s/(#define[[:space:]]+JEITA_WARM_THR[[:space:]]+)450/\1${WARM}/" "$h"
-            done
-          fi
-
-          echo "---- verify ----"
-          grep -nE "warm-th" $Q/alioth-sm8250.dtsi $Q/fg-gen4-batterydata-alioth-*.dtsi $Q/fg-gen4-batterydata-apollo-*.dtsi 2>/dev/null | sed 's#^.*/##'
-          grep -nE "jeita_warm_th - " "$C" 2>/dev/null
-          [ "$fail" -eq 0 ] && echo "ALL PATCHES OK" || echo "::warning::some patches failed, check log above"
-          exit 0
       - name: Kernel Version
         run: |
           cd kernel_tree
