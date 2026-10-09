@@ -182,7 +182,112 @@ jobs:
                   f.write(c)
               print("[+] Successfully restored 300MHz minimum CPU frequency for cluster 0")
           '
+      - name: Patch charge profile (before build)
+        shell: bash {0}
+        env:
+          KERNEL_DIR: "."
+          WARM: "470"
+          BACK: "40"
+        run: |
+          cd "$KERNEL_DIR" || { echo "::warning::KERNEL_DIR not found"; exit 0; }
+          export WARM BACK
+          python3 - <<'PY'
+          import os, re, sys
 
+          WARM = int(os.environ["WARM"])
+          BACK = int(os.environ["BACK"])
+          Q = "arch/arm64/boot/dts/vendor/qcom/"
+          ok = True
+
+          def rd(p):
+              with open(p, encoding="utf-8", errors="surrogateescape") as f:
+                  return f.read()
+
+          def wr(p, s):
+              with open(p, "w", encoding="utf-8", errors="surrogateescape") as f:
+                  f.write(s)
+
+          def fix_ranges(txt, prop):
+              """Extend the '151 <hi>' range to WARM and shift the last range start."""
+              m = re.search(r"(" + re.escape(prop) + r"\s*=\s*<)(.*?)(>;)", txt, re.S)
+              if not m:
+                  return txt, False
+              body = m.group(2)
+              # 151 <old_hi> <val>
+              b2, n1 = re.subn(r"(\b151\s+)\d+(\s+\d+)", lambda x: x.group(1) + str(WARM) + x.group(2), body, count=1)
+              # last range: <old_lo> 480 <val>  -> (WARM+1) 480 <val>
+              b3, n2 = re.subn(r"\b\d+(\s+480\s+\d+\s*)$", lambda x: str(WARM + 1) + x.group(1), b2.rstrip())
+              if n1 == 0:
+                  return txt, False
+              if n2 == 0:
+                  # fv table in alioth-sun: '151 480 4450000' then '481 580 ...'; keep as is
+                  b3 = b2
+              tail = body[len(body.rstrip()):]
+              return txt[:m.start(2)] + b3 + tail + txt[m.end(2):], True
+
+          profiles = [
+              "fg-gen4-batterydata-apollo-sun-5000mah.dtsi",
+              "fg-gen4-batterydata-alioth-sun-5000mah.dtsi",
+              "fg-gen4-batterydata-alioth-FMT-4520mah.dtsi",
+              "fg-gen4-batterydata-alioth-GY-4520mah.dtsi",
+          ]
+          for name in profiles:
+              p = Q + name
+              if not os.path.isfile(p):
+                  print("::warning::missing", name); ok = False; continue
+              t = rd(p)
+              t, a = fix_ranges(t, "qcom,jeita-fcc-ranges")
+              t, b = fix_ranges(t, "qcom,jeita-fv-ranges")
+              t, c = re.subn(r"(qcom,jeita-warm-th\s*=\s*<)\d+(>)", lambda x: x.group(1) + str(WARM) + x.group(2), t)
+              wr(p, t)
+              print(("OK   " if a and c else "FAIL ") + name, "fcc=%s fv=%s warm=%d" % (a, b, c))
+              if not (a and c):
+                  ok = False
+
+          p = Q + "alioth-sm8250.dtsi"
+          if os.path.isfile(p):
+              t = rd(p)
+              for key in ("qcom,chg-warm-th", "mi,qc3-battery-warm-th", "mi,pd-battery-warm-th"):
+                  t, n = re.subn(r"(" + re.escape(key) + r"\s*=\s*<)\d+(>)", lambda x: x.group(1) + str(WARM) + x.group(2), t)
+                  print(("OK   " if n else "FAIL ") + key, n)
+                  if not n:
+                      ok = False
+              wr(p, t)
+          else:
+              print("::warning::alioth-sm8250.dtsi missing"); ok = False
+
+          c = "drivers/power/supply/qcom_cas/step-chg-jeita.c"
+          if os.path.isfile(c):
+              t = rd(c)
+              # JEITA hysteresis 20 -> BACK for temps above the threshold (fv and fcc)
+              t, n = re.subn(
+                  r"(chip->jeita_fv_config->param\.hysteresis\s*=\s*)20;(\s*\n\s*chip->jeita_fcc_config->param\.hysteresis\s*=\s*)20;(\s*\n\s*\})",
+                  lambda x: x.group(1) + str(BACK) + ";" + x.group(2) + str(BACK) + ";" + x.group(3), t, count=1)
+              print(("OK   " if n else "FAIL ") + "hysteresis 20 -> %d (block near 'temp <= JEITA_HYSTERESIS_TEMP_THRED')" % BACK, n)
+              if not n:
+                  ok = False
+              if "MYBUILD-v3" not in t:
+                  t, m = re.subn(
+                      r"(\n\s*rc = get_val\(chip->jeita_fcc_config->fcc_cfg,)",
+                      '\n\tpr_err("MYBUILD-v3: temp=%d warm=%d fcc_hyst=%d\\n", temp, chip->jeita_warm_th, chip->jeita_fcc_config->param.hysteresis);' + r"\1",
+                      t, count=1)
+                  print(("OK   " if m else "FAIL ") + "marker", m)
+                  if not m:
+                      ok = False
+              wr(c, t)
+          else:
+              print("::warning::step-chg-jeita.c missing"); ok = False
+
+          print("ALL PATCHES OK" if ok else "::warning::SOME PATCHES FAILED")
+          PY
+          echo "---- verify ----"
+          Q=arch/arm64/boot/dts/vendor/qcom
+          for f in apollo-sun-5000mah alioth-sun-5000mah alioth-FMT-4520mah alioth-GY-4520mah; do
+            echo "== $f"; sed -n '1,25p' $Q/fg-gen4-batterydata-$f.dtsi | grep -nE "jeita-(fcc|fv)-ranges|^\s+(151|471|441|481)|warm-th"
+          done
+          grep -nE "hysteresis = (5|20|40)" drivers/power/supply/qcom_cas/step-chg-jeita.c | sed -n '1,12p'
+          grep -n "MYBUILD-v3" drivers/power/supply/qcom_cas/step-chg-jeita.c
+          exit 0
       - name: Kernel Version
         run: |
           cd kernel_tree
