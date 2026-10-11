@@ -167,7 +167,7 @@ jobs:
           echo "[+] DONE! Whitelisted: sdg, sdh, sdi, mapper, dm-, vold. Baseband is fully protected."
           echo "==========================================="
 
-      - name: Restore 300MHz Minimum CPU Frequency
+      - name: Set 518MHz Minimum CPU Frequency
         run: |
           cd kernel_tree
           python3 -c '
@@ -175,12 +175,12 @@ jobs:
           with open(file, "r") as f:
               c = f.read()
           target = "\tqcom,cpufreq-table-0 =\n\t\t\t<1171200>,"
-          replacement = "\tqcom,cpufreq-table-0 =\n\t\t\t< 300000>,\n\t\t\t< 518400>,\n\t\t\t< 614400>,\n\t\t\t< 691200>,\n\t\t\t< 787200>,\n\t\t\t< 883200>,\n\t\t\t< 979200>,\n\t\t\t<1075200>,\n\t\t\t<1171200>,"
+          replacement = "\tqcom,cpufreq-table-0 =\n\t\t\t< 518400>,\n\t\t\t< 614400>,\n\t\t\t< 691200>,\n\t\t\t< 787200>,\n\t\t\t< 883200>,\n\t\t\t< 979200>,\n\t\t\t<1075200>,\n\t\t\t<1171200>,"
           if target in c:
               c = c.replace(target, replacement, 1)
               with open(file, "w") as f:
                   f.write(c)
-              print("[+] Successfully restored 300MHz minimum CPU frequency for cluster 0")
+              print("[+] Successfully set 518MHz minimum CPU frequency for cluster 0")
           '
       - name: Patch charge profile (before build)
         shell: bash {0}
