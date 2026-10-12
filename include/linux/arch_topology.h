@@ -25,20 +25,12 @@ unsigned long topology_get_cpu_scale(int cpu)
 
 void topology_set_cpu_scale(unsigned int cpu, unsigned long capacity);
 
-DECLARE_PER_CPU(unsigned long, freq_scale);
+DECLARE_PER_CPU(unsigned long, arch_freq_scale);
 
 static inline
 unsigned long topology_get_freq_scale(int cpu)
 {
-	return per_cpu(freq_scale, cpu);
-}
-
-DECLARE_PER_CPU(unsigned long, max_freq_scale);
-
-static inline
-unsigned long topology_get_max_freq_scale(struct sched_domain *sd, int cpu)
-{
-	return per_cpu(max_freq_scale, cpu);
+	return per_cpu(arch_freq_scale, cpu);
 }
 
 DECLARE_PER_CPU(unsigned long, arch_min_freq_scale);
@@ -48,8 +40,6 @@ static inline unsigned long topology_get_min_freq_scale(int cpu)
 	return per_cpu(arch_min_freq_scale, cpu);
 }
 
-bool topology_scale_freq_invariant(void);
-
 DECLARE_PER_CPU(unsigned long, thermal_pressure);
 
 static inline unsigned long topology_get_thermal_pressure(int cpu)
@@ -57,6 +47,31 @@ static inline unsigned long topology_get_thermal_pressure(int cpu)
 	return per_cpu(thermal_pressure, cpu);
 }
 
-void arch_set_thermal_pressure(struct cpumask *cpus,
-			       unsigned long th_pressure);
+void topology_set_thermal_pressure(const struct cpumask *cpus,
+				   unsigned long th_pressure);
+
+void topology_update_thermal_pressure(const struct cpumask *cpus,
+				      unsigned long capped_freq);
+
+enum scale_freq_source {
+	SCALE_FREQ_SOURCE_CPUFREQ = 0,
+	SCALE_FREQ_SOURCE_ARCH,
+};
+
+struct scale_freq_data {
+	enum scale_freq_source source;
+	void (*set_freq_scale)(void);
+};
+
+void topology_scale_freq_tick(void);
+void topology_set_scale_freq_source(struct scale_freq_data *data, const struct cpumask *cpus);
+void topology_clear_scale_freq_source(enum scale_freq_source source, const struct cpumask *cpus);
+
+void topology_set_freq_scale(const struct cpumask *cpus, unsigned long cur_freq,
+			     unsigned long max_freq);
+
+bool topology_scale_freq_invariant(void);
+
+bool arch_freq_counters_available(const struct cpumask *cpus);
+
 #endif /* _LINUX_ARCH_TOPOLOGY_H_ */

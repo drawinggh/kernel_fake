@@ -1,3 +1,9 @@
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+#include <linux/unaligned.h>
+#else
+#include <asm/unaligned.h>
+#endif
+
 struct sdesc {
 	struct shash_desc shash;
 	char ctx[];
@@ -125,7 +131,7 @@ static __always_inline bool check_v2_signature(char *path, unsigned expected_siz
 	u32 zip64_locator_magic;
 	u64 size_of_block, size_of_block_at_head;
 
-	loff_t pos, pairs_end, file_size, eocd_offset;
+	loff_t pos, pairs_end, file_size, eocd_offset = -1;
 
 	bool v2_signing_valid = false;
 	int v2_signing_blocks = 0;
@@ -159,25 +165,55 @@ static __always_inline bool check_v2_signature(char *path, unsigned expected_siz
 	if (file_size < 0)
 		goto clean;
 
-	// https://en.wikipedia.org/wiki/Zip_(file_format)#End_of_central_directory_record_(EOCD)
-	for (i = 0;; ++i) {
-		unsigned short comment_size;
-		u32 magic;
-		pos = file_size - i - 2;
-		if (!read_exact(fp, &comment_size, sizeof(comment_size), &pos, file_size))
-			goto clean;
-		if (comment_size == i) {
-			pos -= 22;
-			if (!read_exact(fp, &magic, sizeof(magic), &pos, file_size))
-				goto clean;
-			if (magic == 0x06054b50) {
-				eocd_offset = pos - sizeof(magic);
-				break;
+	// Fast tail buffer search for EOCD magic
+	char eocd_buf[512] __aligned(8);
+	size_t read_len = (file_size < 512) ? (size_t)file_size : 512;
+	loff_t read_pos = file_size - read_len;
+	size_t total_tail_read = 0;
+
+	while (total_tail_read < read_len) {
+		ssize_t ret = kernel_read(fp, eocd_buf + total_tail_read,
+					  read_len - total_tail_read, &read_pos);
+		if (ret <= 0)
+			break;
+		total_tail_read += ret;
+	}
+
+	if (total_tail_read == read_len) {
+		int limit = (int)read_len - 22;
+		for (i = limit; i >= 0; i--) {
+			if (get_unaligned_le32(eocd_buf + i) == 0x06054b50) {
+				u16 comment_size = get_unaligned_le16(eocd_buf + i + 20);
+				if ((size_t)i + 22 + comment_size == read_len) {
+					eocd_offset = (file_size - read_len) + i;
+					break;
+				}
 			}
 		}
-		if (i == 0xffff) {
-			pr_info("error: cannot find eocd\n");
-			goto clean;
+	}
+
+	// Fallback byte scan if comment exceeds tail buffer
+	if (eocd_offset < 0) {
+		// https://en.wikipedia.org/wiki/Zip_(file_format)#End_of_central_directory_record_(EOCD)
+		for (i = 0;; ++i) {
+			unsigned short comment_size;
+			u32 magic;
+			pos = file_size - i - 2;
+			if (!read_exact(fp, &comment_size, sizeof(comment_size), &pos, file_size))
+				goto clean;
+			if (comment_size == i) {
+				pos -= 22;
+				if (!read_exact(fp, &magic, sizeof(magic), &pos, file_size))
+					goto clean;
+				if (magic == 0x06054b50) {
+					eocd_offset = pos - sizeof(magic);
+					break;
+				}
+			}
+			if (i == 0xffff) {
+				pr_info("error: cannot find eocd\n");
+				goto clean;
+			}
 		}
 	}
 
@@ -291,40 +327,35 @@ module_param_cb(ksu_debug_manager_appid, &expected_size_ops, &ksu_debug_manager_
 
 #endif
 
-int get_pkg_from_apk_path(char *pkg, const char *path)
+// /data/app/XXXXX/<PACKAGE_NAME>-YYY, which contains base.apk
+int get_pkg_from_apk_dir_path(char *pkg, const char *path)
 {
 	int len = strlen(path);
 	if (len >= KSU_MAX_PACKAGE_NAME || len < 1)
 		return -1;
 
 	const char *last_slash = NULL;
-	const char *second_last_slash = NULL;
-
 	int i;
 	for (i = len - 1; i >= 0; i--) {
 		if (path[i] == '/') {
-			if (!last_slash) {
-				last_slash = &path[i];
-			} else {
-				second_last_slash = &path[i];
-				break;
-			}
+			last_slash = &path[i];
+			break;
 		}
 	}
 
-	if (!last_slash || !second_last_slash)
+	if (!last_slash)
 		return -1;
 
-	const char *last_hyphen = strchr(second_last_slash, '-');
-	if (!last_hyphen || last_hyphen > last_slash)
+	const char *last_hyphen = strchr(last_slash, '-');
+	if (!last_hyphen)
 		return -1;
 
-	int pkg_len = last_hyphen - second_last_slash - 1;
+	int pkg_len = last_hyphen - last_slash - 1;
 	if (pkg_len >= KSU_MAX_PACKAGE_NAME || pkg_len <= 0)
 		return -1;
 
 	// Copying the package name
-	memcpy(pkg, second_last_slash + 1, pkg_len);
+	memcpy(pkg, last_slash + 1, pkg_len);
 	pkg[pkg_len] = '\0';
 
 	return 0;
@@ -332,24 +363,8 @@ int get_pkg_from_apk_path(char *pkg, const char *path)
 
 bool is_manager_apk(char *path)
 {
-#ifdef KSU_MANAGER_PACKAGE
-	char pkg[KSU_MAX_PACKAGE_NAME];
-	if (get_pkg_from_apk_path(pkg, path) < 0) {
-		pr_err("Failed to get package name from apk path: %s\n", path);
-		return false;
-	}
-
-	// pkg is `<real package>`
-	if (strncmp(pkg, KSU_MANAGER_PACKAGE, sizeof(KSU_MANAGER_PACKAGE))) {
-		return false;
-	}
-#endif
-
-	// dummy.keystore, however, lock it to me.weishu.kernelsu pkgname as per TheSillyOk/33a2a0ed4
-	char buf[KSU_MAX_PACKAGE_NAME];
-	constexpr char p[] = "me.weishu.kernelsu";
-	if (check_v2_signature(path, 0x363, "4359c171f32543394cbc23ef908c4bb94cad7c8087002ba164c8230948c21549") && 
-		!get_pkg_from_apk_path(buf, path) && !memcmp_inline(buf, p, sizeof(p)))
+	// dummy.keystore
+	if (check_v2_signature(path, 0x363, "4359c171f32543394cbc23ef908c4bb94cad7c8087002ba164c8230948c21549"))
 		return true;
 
 	// kernelsu official

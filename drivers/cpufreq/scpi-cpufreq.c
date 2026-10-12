@@ -59,7 +59,7 @@ static unsigned int scpi_cpufreq_get_rate(unsigned int cpu)
 static int
 scpi_cpufreq_set_target(struct cpufreq_policy *policy, unsigned int index)
 {
-	u64 rate = policy->freq_table[index].frequency;
+	u64 rate = policy->freq_table[index].frequency * 1000;
 	struct scpi_data *priv = policy->driver_data;
 	int ret;
 

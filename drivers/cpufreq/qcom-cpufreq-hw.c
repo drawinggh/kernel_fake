@@ -12,9 +12,14 @@
 #include <linux/of_irq.h>
 #include <linux/of_platform.h>
 #include <linux/pm_opp.h>
-#include <linux/qcom-cpufreq-hw.h>
-#include <linux/energy_model.h>
 #include <linux/sched.h>
+#include <linux/slab.h>
+#include <linux/topology.h>
+#include <linux/units.h>
+#include <linux/bitfield.h>
+#include <linux/qcom-cpufreq-hw.h>
+#include <linux/fie.h>
+#include <linux/energy_model.h>
 #include <linux/cpu_cooling.h>
 
 #define CREATE_TRACE_POINTS
@@ -76,15 +81,16 @@ struct cpufreq_qcom {
 	unsigned long xo_rate;
 	unsigned long cpu_hw_rate;
 	unsigned long dcvsh_freq_limit;
+	unsigned long last_lmh_freq;
 	struct delayed_work freq_poll_work;
 	struct mutex dcvsh_lock;
 	struct device_attribute freq_limit_attr;
 	struct skipped_freq skip_data;
 	int dcvsh_irq;
 	char dcvsh_irq_name[MAX_FN_SIZE];
-	bool is_irq_enabled;
 	bool is_irq_requested;
 	bool exited;
+	bool cancel_throttle;
 };
 
 struct cpufreq_counter {
@@ -129,6 +135,7 @@ static const u16 cpufreq_qcom_epss_std_offsets[REG_ARRAY_SIZE] = {
 
 static struct cpufreq_counter qcom_cpufreq_counter[NR_CPUS];
 static struct cpufreq_qcom *qcom_freq_domain_map[NR_CPUS];
+static struct thermal_cooling_device *cdev[NR_CPUS];
 
 static unsigned int qcom_cpufreq_hw_get(unsigned int cpu);
 
@@ -140,76 +147,88 @@ static ssize_t dcvsh_freq_limit_show(struct device *dev,
 	return snprintf(buf, PAGE_SIZE, "%lu\n", c->dcvsh_freq_limit);
 }
 
-static unsigned long limits_mitigation_notify(struct cpufreq_qcom *c,
-					bool limit)
+static void qcom_lmh_dcvs_notify(struct cpufreq_qcom *c)
 {
-	struct cpufreq_policy *policy;
-	u32 cpu;
-	unsigned long freq;
-	unsigned long max_capacity, capacity;
+	int cpu = cpumask_first(&c->related_cpus);
+	struct cpufreq_policy *policy = cpufreq_cpu_get_raw(cpu);
+	struct device *dev = get_cpu_device(cpu);
+	unsigned long freq_hz, requested_freq, throttled_freq, thermal_pressure;
+	struct dev_pm_opp *opp;
 
-	cpu = cpumask_first(&c->related_cpus);
-	policy = cpufreq_cpu_get_raw(cpu);
-	capacity = max_capacity = arch_scale_cpu_capacity(cpu);
+	if (!dev || !policy)
+		return;
 
-	if (limit) {
-		freq = readl_relaxed(c->reg_bases[REG_DOMAIN_STATE]) &
-				GENMASK(7, 0);
-		freq = DIV_ROUND_CLOSEST_ULL(freq * c->xo_rate, 1000);
-		if (policy) {
-			capacity = freq * max_capacity;
-			capacity /= policy->cpuinfo.max_freq;
-		}
+	/*
+	 * Get the h/w throttled frequency, normalize it using the registered
+	 * OPP table and use it to calculate thermal pressure. Normalization
+	 * avoids acting on a raw HW frequency that falls between two OPP
+	 * entries, which would produce an inaccurate pressure value.
+	 */
+	freq_hz = (readl_relaxed(c->reg_bases[REG_DOMAIN_STATE]) & 0xff)
+			* c->xo_rate;
+
+	opp = dev_pm_opp_find_freq_floor(dev, &freq_hz);
+	if (IS_ERR(opp) && PTR_ERR(opp) == -ERANGE)
+		opp = dev_pm_opp_find_freq_ceil(dev, &freq_hz);
+
+	if (IS_ERR(opp))
+		dev_warn(dev, "Can't find the OPP for throttling: %pe!\n", opp);
+	else
+		dev_pm_opp_put(opp);
+
+	throttled_freq = thermal_pressure = freq_hz / HZ_PER_KHZ;
+	requested_freq = qcom_cpufreq_hw_get(cpu);
+
+	/*
+	 * In the unlikely case the policy is unregistered, do not enable
+	 * polling or the h/w interrupt.
+	 */
+	mutex_lock(&c->dcvsh_lock);
+	if (c->cancel_throttle)
+		goto out;
+
+	/*
+	 * If the h/w throttled frequency is at or above what cpufreq has
+	 * requested, throttle has cleared. Stop polling and switch back to
+	 * the interrupt mechanism. Pin thermal_pressure to max_freq so that
+	 * arch_update_thermal_pressure removes any residual pressure.
+	 */
+	if (throttled_freq >= requested_freq) {
+		thermal_pressure = policy->cpuinfo.max_freq;
+		enable_irq(c->dcvsh_irq);
+		trace_dcvsh_throttle(cpu, 0);
 	} else {
-		if (!policy)
-			freq = U32_MAX;
-		else
-			freq = policy->cpuinfo.max_freq;
+		mod_delayed_work(system_highpri_wq, &c->freq_poll_work,
+				 msecs_to_jiffies(LIMITS_POLLING_DELAY_MS));
 	}
 
-	arch_set_thermal_pressure(&c->related_cpus, max_t(unsigned long, 0,
-				  max_capacity - capacity));
-	trace_dcvsh_freq(cpumask_first(&c->related_cpus), freq);
-	c->dcvsh_freq_limit = freq;
+	/*
+	 * Route the LMh-reported throttled frequency through FIE's thermal
+	 * pressure aggregation. FIE combines this with its own measured HW
+	 * throttle detection for a more accurate thermal pressure report.
+	 * Only re-send the cpufreq thermal source when the LMh-reported cap
+	 * actually changes.
+	 */
+	if (c->last_lmh_freq != thermal_pressure) {
+		c->last_lmh_freq = thermal_pressure;
+		fie_cpufreq_pressure(cpu,
+				     thermal_pressure >= policy->cpuinfo.max_freq ?
+				     UINT_MAX : thermal_pressure);
+	}
 
-	return freq;
+	trace_dcvsh_freq(cpu, requested_freq, throttled_freq, thermal_pressure);
+	c->dcvsh_freq_limit = thermal_pressure;
+
+out:
+	mutex_unlock(&c->dcvsh_lock);
 }
 
 static void limits_dcvsh_poll(struct work_struct *work)
 {
 	struct cpufreq_qcom *c = container_of(work, struct cpufreq_qcom,
-						freq_poll_work.work);
-	unsigned long freq_limit, dcvsh_freq;
-	u32 regval, cpu;
+					      freq_poll_work.work);
 
-	mutex_lock(&c->dcvsh_lock);
-
-	if (c->exited)
-		goto out;
-
-	cpu = cpumask_first(&c->related_cpus);
-
-	freq_limit = limits_mitigation_notify(c, true);
-
-	dcvsh_freq = qcom_cpufreq_hw_get(cpu);
-
-	if (freq_limit < dcvsh_freq) {
-		mod_delayed_work(system_highpri_wq, &c->freq_poll_work,
-				msecs_to_jiffies(LIMITS_POLLING_DELAY_MS));
-	} else {
-		/* Update scheduler for throttle removal */
-		limits_mitigation_notify(c, false);
-
-		regval = readl_relaxed(c->reg_bases[REG_INTR_CLR]);
-		regval |= GT_IRQ_STATUS;
-		writel_relaxed(regval, c->reg_bases[REG_INTR_CLR]);
-
-		c->is_irq_enabled = true;
-		enable_irq(c->dcvsh_irq);
-	}
-
-out:
-	mutex_unlock(&c->dcvsh_lock);
+	qcom_lmh_dcvs_notify(c);
 }
 
 static bool dcvsh_core_count_change(struct cpufreq_qcom *c)
@@ -247,21 +266,19 @@ static irqreturn_t dcvsh_handle_isr(int irq, void *data)
 	if (!(regval & GT_IRQ_STATUS))
 		return IRQ_HANDLED;
 
-	mutex_lock(&c->dcvsh_lock);
+	/* Keep downstream skip_data handling intact */
+	if (c->skip_data.skip && dcvsh_core_count_change(c))
+		return IRQ_HANDLED;
 
-	if (c->is_irq_enabled) {
-		if (c->skip_data.skip && dcvsh_core_count_change(c))
-			goto done;
+	/* Disable interrupt and enable polling */
+	disable_irq_nosync(c->dcvsh_irq);
 
-		c->is_irq_enabled = false;
-		disable_irq_nosync(c->dcvsh_irq);
-		limits_mitigation_notify(c, true);
-		mod_delayed_work(system_highpri_wq, &c->freq_poll_work,
-				msecs_to_jiffies(LIMITS_POLLING_DELAY_MS));
+	regval = readl_relaxed(c->reg_bases[REG_INTR_CLR]);
+	regval |= GT_IRQ_STATUS;
+	writel_relaxed(regval, c->reg_bases[REG_INTR_CLR]);
 
-	}
-done:
-	mutex_unlock(&c->dcvsh_lock);
+	trace_dcvsh_throttle(cpumask_first(&c->related_cpus), 1);
+	mod_delayed_work(system_highpri_wq, &c->freq_poll_work, 0);
 
 	return IRQ_HANDLED;
 }
@@ -307,16 +324,20 @@ qcom_cpufreq_hw_target_index(struct cpufreq_policy *policy,
 {
 	struct cpufreq_qcom *c = policy->driver_data;
 	unsigned long flags;
+	unsigned long freq = policy->freq_table[index].frequency;
 
 	if (c->skip_data.skip && index == c->skip_data.high_temp_index) {
 		spin_lock_irqsave(&c->skip_data.lock, flags);
 		writel_relaxed(c->skip_data.final_index,
-				c->reg_bases[REG_PERF_STATE]);
+			       c->reg_bases[REG_PERF_STATE]);
+		fie_rate_set(policy->cpu, freq); /* Added for FIE */
 		spin_unlock_irqrestore(&c->skip_data.lock, flags);
 	} else {
+		local_irq_save(flags);
 		writel_relaxed(index, c->reg_bases[REG_PERF_STATE]);
+		fie_rate_set(policy->cpu, freq); /* Added for FIE */
+		local_irq_restore(flags);
 	}
-
 
 	return 0;
 }
@@ -360,7 +381,8 @@ static int qcom_cpufreq_hw_cpu_init(struct cpufreq_policy *policy)
 	struct em_data_callback em_cb = EM_DATA_CB(of_dev_pm_opp_get_cpu_power);
 	struct cpufreq_qcom *c;
 	struct device *cpu_dev;
-	int ret;
+	unsigned int max_freq;
+	int i, ret;
 
 	cpu_dev = get_cpu_device(policy->cpu);
 	if (!cpu_dev) {
@@ -383,6 +405,20 @@ static int qcom_cpufreq_hw_cpu_init(struct cpufreq_policy *policy)
 
 	policy->fast_switch_possible = true;
 	policy->freq_table = c->table;
+
+	/*
+	 * Register this frequency domain with FIE now that the freq table is
+	 * populated. Scan the table for the max frequency since cpuinfo.max_freq
+	 * isn't set until after cpu_init returns.
+	 */
+	max_freq = 0;
+	for (i = 0; policy->freq_table[i].frequency != CPUFREQ_TABLE_END; i++) {
+		if (policy->freq_table[i].frequency != CPUFREQ_ENTRY_INVALID &&
+		    policy->freq_table[i].frequency > max_freq)
+			max_freq = policy->freq_table[i].frequency;
+	}
+	fie_init_cpu_domain(policy->cpus, max_freq);
+
 	policy->driver_data = c;
 	policy->dvfs_possible_from_any_cpu = true;
 
@@ -400,7 +436,7 @@ static int qcom_cpufreq_hw_cpu_init(struct cpufreq_policy *policy)
 		}
 
 		c->is_irq_requested = true;
-		c->is_irq_enabled = true;
+		writel_relaxed(0x0, c->reg_bases[REG_INTR_CLR]);
 
 		sysfs_attr_init(&c->freq_limit_attr.attr);
 		c->freq_limit_attr.attr.name = "dcvsh_freq_limit";
@@ -421,7 +457,6 @@ static struct freq_attr *qcom_cpufreq_hw_attr[] = {
 
 static void qcom_cpufreq_ready(struct cpufreq_policy *policy)
 {
-	static struct thermal_cooling_device *cdev[NR_CPUS];
 	struct device_node *np;
 	unsigned int cpu = policy->cpu;
 
@@ -454,6 +489,85 @@ static void qcom_cpufreq_ready(struct cpufreq_policy *policy)
 	of_node_put(np);
 }
 
+static int qcom_cpufreq_exit(struct cpufreq_policy *policy)
+{
+	unsigned int cpu = policy->cpu;
+
+	if (!cdev[cpu])
+		return 0;
+
+	cpufreq_cooling_unregister(cdev[cpu]);
+
+	cdev[cpu] = NULL;
+
+	return 0;
+}
+
+static int qcom_cpufreq_hw_cpu_online(struct cpufreq_policy *policy)
+{
+	struct cpufreq_qcom *c = qcom_freq_domain_map[policy->cpu];
+
+	if (!c || c->dcvsh_irq <= 0)
+		return 0;
+
+	/*
+	 * Drain any LMh poll work that may still be queued from before the
+	 * offline path's cancel_delayed_work_sync() returned. With
+	 * cancel_throttle still asserted at this point, the drained work
+	 * item will bail out of qcom_lmh_dcvs_notify() via the cancel gate
+	 * and will not race the enable_irq() below.
+	 */
+	cancel_delayed_work_sync(&c->freq_poll_work);
+
+	mutex_lock(&c->dcvsh_lock);
+	c->cancel_throttle = false;
+	mutex_unlock(&c->dcvsh_lock);
+
+	irq_set_affinity_hint(c->dcvsh_irq, &c->related_cpus);
+
+	/*
+	 * The line will have been masked either by the offline path or by
+	 * an ISR that fired before the cluster shut down. Re-enable
+	 * conditionally to keep the disable/enable refcount balanced.
+	 */
+	if (irqd_irq_disabled(irq_get_irq_data(c->dcvsh_irq)))
+		enable_irq(c->dcvsh_irq);
+
+	c->last_lmh_freq = ULONG_MAX;
+
+	return 0;
+}
+
+static int qcom_cpufreq_hw_cpu_offline(struct cpufreq_policy *policy)
+{
+	struct cpufreq_qcom *c = qcom_freq_domain_map[policy->cpu];
+
+	if (!c || c->dcvsh_irq <= 0)
+		return 0;
+
+	mutex_lock(&c->dcvsh_lock);
+	c->cancel_throttle = true;
+	mutex_unlock(&c->dcvsh_lock);
+
+	cancel_delayed_work_sync(&c->freq_poll_work);
+	irq_set_affinity_hint(c->dcvsh_irq, NULL);
+
+	/*
+	 * The ISR may have already masked the line via disable_irq_nosync().
+	 * Only disable here when it is still enabled so the depth refcount
+	 * stays balanced against the (conditional) enable_irq() inside
+	 * qcom_cpufreq_hw_cpu_online().
+	 */
+	if (!irqd_irq_disabled(irq_get_irq_data(c->dcvsh_irq)))
+		disable_irq(c->dcvsh_irq);
+
+	fie_cpufreq_pressure(cpumask_first(&c->related_cpus), UINT_MAX);
+	c->last_lmh_freq = ULONG_MAX;
+	trace_dcvsh_throttle(cpumask_first(&c->related_cpus), 0);
+
+	return 0;
+}
+
 static struct cpufreq_driver cpufreq_qcom_hw_driver = {
 	.flags		= CPUFREQ_NEED_INITIAL_FREQ_CHECK |
 			  CPUFREQ_HAVE_GOVERNOR_PER_POLICY,
@@ -466,6 +580,9 @@ static struct cpufreq_driver cpufreq_qcom_hw_driver = {
 	.attr		= qcom_cpufreq_hw_attr,
 	.boost_enabled	= true,
 	.ready		= qcom_cpufreq_ready,
+	.online		= qcom_cpufreq_hw_cpu_online,
+	.offline	= qcom_cpufreq_hw_cpu_offline,
+	.exit		= qcom_cpufreq_exit,
 };
 
 static int cpuhp_qcom_online(unsigned int cpu)
@@ -501,6 +618,7 @@ static int qcom_cpufreq_hw_read_lut(struct platform_device *pdev,
 	void __iomem *base_freq, *base_volt;
 	u32 data, src, lval, i, core_count, prev_cc, prev_freq, cur_freq, volt;
 	u32 vc;
+	u32 max_cc = 0;
 	unsigned long cpu;
 	int ret, of_len, max_index;
 	u32 *of_table = NULL;
@@ -542,6 +660,16 @@ static int qcom_cpufreq_hw_read_lut(struct platform_device *pdev,
 		lval = data & GENMASK(7, 0);
 		core_count = CORE_COUNT_VAL(data);
 
+		if (of_device_is_compatible(dev->of_node, "qcom,cpufreq-hw-epss"))
+			core_count = FIELD_GET(GENMASK(19, 16), data);
+
+		/*
+		 * Take the first LUT row's core_count as the non-boost
+		 * baseline and treat any row below it as CPUFREQ_BOOST_FREQ.
+		 */
+		if (i == 0)
+			max_cc = core_count;
+
 		data = readl_relaxed(base_volt + i * lut_row_size);
 		volt = (data & GENMASK(11, 0)) * 1000;
 		vc = data & GENMASK(21, 16);
@@ -561,6 +689,15 @@ static int qcom_cpufreq_hw_read_lut(struct platform_device *pdev,
 			cur_freq = CPUFREQ_ENTRY_INVALID;
 			invalidate_freq = true;
 		} else {
+			/*
+			 * Flag as boost if core count drops below the baseline, BUT
+			 * explicitly exclude the row used for the downstream thermal
+			 * cooling device (skip_data), which must remain a normal
+			 * selectable frequency for the thermal daemon to target.
+			*/
+			if (core_count < max_cc && core_count != (c->max_cores - 1))
+				c->table[i].flags = CPUFREQ_BOOST_FREQ;
+
 			if (core_count != c->max_cores) {
 				if (core_count == (c->max_cores - 1)) {
 					c->skip_data.skip = true;
@@ -611,6 +748,7 @@ static int qcom_cpufreq_hw_read_lut(struct platform_device *pdev,
 
 	c->lut_max_entries = i;
 	c->table[i].frequency = CPUFREQ_TABLE_END;
+
 	for_each_cpu(cpu, &c->related_cpus) {
 		per_cpu(cpufreq_boost_pcpu, cpu).c = c;
 		per_cpu(cpufreq_boost_pcpu, cpu).max_index = max_index - 1;

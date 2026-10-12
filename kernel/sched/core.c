@@ -12,6 +12,7 @@
 #include <linux/kcov.h>
 #include <linux/delay.h>
 #include <linux/scs.h>
+#include <linux/fie.h>
 
 #include <asm/switch_to.h>
 #include <asm/tlb.h>
@@ -199,6 +200,7 @@ void update_rq_clock(struct rq *rq)
 	delta = sched_clock_cpu(cpu_of(rq)) - rq->clock;
 	if (delta < 0)
 		return;
+	fie_update_rq_clock(rq);
 	rq->clock += delta;
 	update_rq_clock_task(rq, delta);
 }
@@ -3822,6 +3824,7 @@ static struct rq *finish_task_switch(struct task_struct *prev)
 	vtime_task_switch(prev);
 	perf_event_task_sched_in(prev, current);
 	finish_task(prev);
+	tick_nohz_task_switch();
 	finish_lock_switch(rq);
 	finish_arch_post_lock_switch();
 	kcov_finish_switch(current);
@@ -3863,7 +3866,6 @@ static struct rq *finish_task_switch(struct task_struct *prev)
 		put_task_struct_rcu_user(prev);
 	}
 
-	tick_nohz_task_switch();
 	return rq;
 }
 
@@ -4163,6 +4165,7 @@ void scheduler_tick(void)
 
 	rq_lock(rq, &rf);
 	update_rq_clock(rq);
+	fie_tick_entry();
 	thermal_pressure = arch_scale_thermal_pressure(cpu_of(rq));
 	update_thermal_load_avg(rq_clock_thermal(rq), rq, thermal_pressure);
 	curr->sched_class->task_tick(rq, curr, 0);
@@ -7514,7 +7517,7 @@ void __init sched_init(void)
 #ifdef CONFIG_SMP
 		rq->sd = NULL;
 		rq->rd = NULL;
-		rq->cpu_capacity = rq->cpu_capacity_orig = SCHED_CAPACITY_SCALE;
+		rq->cpu_capacity = SCHED_CAPACITY_SCALE;
 		rq->fits_capacity_threshold = SCHED_CAPACITY_SCALE;
 		rq->balance_callback = NULL;
 		rq->active_balance = 0;
@@ -8276,18 +8279,28 @@ struct uclamp_param {
 	char uclamp_min[3];
 	char uclamp_max[3];
 	u64  uclamp_latency_sensitive;
+	u64  cpu_shares;
 };
+
+#ifdef CONFIG_FAIR_GROUP_SCHED
+static int cpu_shares_write_u64(struct cgroup_subsys_state *css,
+				struct cftype *cftype, u64 shareval);
+#endif
 
 static void uclamp_set(struct cgroup_subsys_state *css)
 {
 	int i;
 
 	static struct uclamp_param tgts[] = {
-		{"top-app",             "0", "max",  1},
-       		{"foreground",          "0",  "80",  0},
-                {"dex2oat",             "0",  "30",  0},
-        	{"background",          "0",  "30",  0},
-        	{"system-background",   "0",  "50",  0},
+		{"top-app",             "0", "max", 1, 20480},
+		{"rt",			"0", "max", 0, 20480},
+		{"nnapi-hal",		"0", "max", 0, 20480},
+		{"foreground",          "0", "80",  0, 12288},
+		{"camera-daemon",       "0", "max", 0, 20480},
+		{"system",              "0", "max", 0, 20480},
+		{"dex2oat",             "0", "20",  0, 	 512},
+		{"background",          "0", "30",  0,  1024},
+		{"system-background",   "0", "50",  0, 10240},
 	};
 
         if(!css->cgroup->kn)
@@ -8304,8 +8317,18 @@ static void uclamp_set(struct cgroup_subsys_state *css)
 			cpu_uclamp_ls_write_u64(css, NULL,
 						tgt.uclamp_latency_sensitive);
 
-			pr_info("uclamp_assist: setting values for %s: uclamp_min=%s uclamp_max=%s uclamp_latency_sensitive=%d\n",
-				tgt.name, tgt.uclamp_min, tgt.uclamp_max,tgt.uclamp_latency_sensitive);
+#ifdef CONFIG_FAIR_GROUP_SCHED
+			cpu_shares_write_u64(css, NULL, tgt.cpu_shares);
+#endif
+
+#ifdef CONFIG_FAIR_GROUP_SCHED
+			pr_info("uclamp_assist: setting values for %s: uclamp_min=%s uclamp_max=%s"
+				"uclamp_latency_sensitive=%d cpu_shares=%d\n",
+				tgt.name, tgt.uclamp_min, tgt.uclamp_max, tgt.uclamp_latency_sensitive, tgt.cpu_shares);
+#else
+                        pr_info("uclamp_assist: setting values for %s: uclamp_min=%s uclamp_max=%s uclamp_latency_sensitive=%d\n"
+                                tgt.name, tgt.uclamp_min, tgt.uclamp_max, tgt.uclamp_latency_sensitive);
+#endif
 			return;
 		}
 	}

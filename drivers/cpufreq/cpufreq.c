@@ -95,7 +95,7 @@ static void cpufreq_governor_limits(struct cpufreq_policy *policy);
  * changes to devices when the CPU clock speed changes.
  * The mutex locks both lists.
  */
-SRCU_NOTIFIER_HEAD_STATIC(cpufreq_policy_notifier_list);
+static BLOCKING_NOTIFIER_HEAD(cpufreq_policy_notifier_list);
 SRCU_NOTIFIER_HEAD_STATIC(cpufreq_transition_notifier_list);
 
 static int off __read_mostly;
@@ -158,19 +158,6 @@ u64 get_cpu_idle_time(unsigned int cpu, u64 *wall, int io_busy)
 	return idle_time;
 }
 EXPORT_SYMBOL_GPL(get_cpu_idle_time);
-
-__weak void arch_set_freq_scale(const struct cpumask *cpus,
-				unsigned long cur_freq,
-				unsigned long max_freq)
-{
-}
-EXPORT_SYMBOL_GPL(arch_set_freq_scale);
-
-__weak void arch_set_max_freq_scale(const struct cpumask *cpus,
-				    unsigned long policy_max_freq)
-{
-}
-EXPORT_SYMBOL_GPL(arch_set_max_freq_scale);
 
 __weak void arch_set_min_freq_scale(const struct cpumask *cpus,
 				    unsigned long min_freq,
@@ -326,11 +313,14 @@ static void cpufreq_notify_transition(struct cpufreq_policy *policy,
 				      struct cpufreq_freqs *freqs,
 				      unsigned int state)
 {
+	int cpu;
+
 	BUG_ON(irqs_disabled());
 
 	if (cpufreq_disabled())
 		return;
 
+	freqs->policy = policy;
 	freqs->flags = cpufreq_driver->flags;
 	pr_debug("notification %u of frequency transition to %u kHz\n",
 		 state, freqs->new);
@@ -350,10 +340,8 @@ static void cpufreq_notify_transition(struct cpufreq_policy *policy,
 			}
 		}
 
-		for_each_cpu(freqs->cpu, policy->cpus) {
-			srcu_notifier_call_chain(&cpufreq_transition_notifier_list,
-						 CPUFREQ_PRECHANGE, freqs);
-		}
+		srcu_notifier_call_chain(&cpufreq_transition_notifier_list,
+					 CPUFREQ_PRECHANGE, freqs);
 
 		adjust_jiffies(CPUFREQ_PRECHANGE, freqs);
 		break;
@@ -363,11 +351,11 @@ static void cpufreq_notify_transition(struct cpufreq_policy *policy,
 		pr_debug("FREQ: %u - CPUs: %*pbl\n", freqs->new,
 			 cpumask_pr_args(policy->cpus));
 
-		for_each_cpu(freqs->cpu, policy->cpus) {
-			trace_cpu_frequency(freqs->new, freqs->cpu);
-			srcu_notifier_call_chain(&cpufreq_transition_notifier_list,
-						 CPUFREQ_POSTCHANGE, freqs);
-		}
+		for_each_cpu(cpu, policy->cpus)
+			trace_cpu_frequency(freqs->new, cpu);
+
+		srcu_notifier_call_chain(&cpufreq_transition_notifier_list,
+					 CPUFREQ_POSTCHANGE, freqs);
 
 		cpufreq_stats_record_transition(policy, freqs->new);
 		cpufreq_times_record_transition(policy, freqs->new);
@@ -1111,7 +1099,7 @@ static struct cpufreq_policy *cpufreq_policy_alloc(unsigned int cpu)
 	if (!policy)
 		return NULL;
 
-	if (!alloc_cpumask_var(&policy->cpus, GFP_KERNEL))
+	if (!zalloc_cpumask_var(&policy->cpus, GFP_KERNEL))
 		goto err_free_policy;
 
 	if (!zalloc_cpumask_var(&policy->related_cpus, GFP_KERNEL))
@@ -1119,6 +1107,8 @@ static struct cpufreq_policy *cpufreq_policy_alloc(unsigned int cpu)
 
 	if (!zalloc_cpumask_var(&policy->real_cpus, GFP_KERNEL))
 		goto err_free_rcpumask;
+
+	init_rwsem(&policy->rwsem);
 
 	init_completion(&policy->kobj_unregister);
 	ret = kobject_init_and_add(&policy->kobj, &ktype_cpufreq,
@@ -1130,7 +1120,6 @@ static struct cpufreq_policy *cpufreq_policy_alloc(unsigned int cpu)
 	}
 
 	INIT_LIST_HEAD(&policy->policy_list);
-	init_rwsem(&policy->rwsem);
 	spin_lock_init(&policy->transition_lock);
 	init_waitqueue_head(&policy->transition_wait);
 	INIT_WORK(&policy->update, handle_update);
@@ -1183,6 +1172,9 @@ static void cpufreq_policy_free(struct cpufreq_policy *policy)
 	 */
 	if (unlikely(!policy_is_inactive(policy)))
 		pr_warn("%s: Freeing active policy\n", __func__);
+
+	blocking_notifier_call_chain(&cpufreq_policy_notifier_list,
+				     CPUFREQ_REMOVE_POLICY, policy);
 
 	/* Remove policy from list */
 	write_lock_irqsave(&cpufreq_driver_lock, flags);
@@ -1352,6 +1344,11 @@ static int cpufreq_online(unsigned int cpu)
 		/* cpufreq_policy_free() will notify based on this */
 		new_policy = false;
 		goto out_destroy_policy;
+	}
+
+	if (new_policy) {
+		blocking_notifier_call_chain(&cpufreq_policy_notifier_list,
+				CPUFREQ_CREATE_POLICY, policy);
 	}
 
 	up_write(&policy->rwsem);
@@ -1580,6 +1577,26 @@ unsigned int cpufreq_quick_get_max(unsigned int cpu)
 	return ret_freq;
 }
 EXPORT_SYMBOL(cpufreq_quick_get_max);
+
+/**
+ * cpufreq_get_hw_max_freq - get the max hardware frequency of the CPU
+ * @cpu: CPU number
+ *
+ * The default return value is the max_freq field of cpuinfo.
+ */
+__weak unsigned int cpufreq_get_hw_max_freq(unsigned int cpu)
+{
+	struct cpufreq_policy *policy = cpufreq_cpu_get(cpu);
+	unsigned int ret_freq = 0;
+
+	if (policy) {
+		ret_freq = policy->cpuinfo.max_freq;
+		cpufreq_cpu_put(policy);
+	}
+
+	return ret_freq;
+}
+EXPORT_SYMBOL(cpufreq_get_hw_max_freq);
 
 static unsigned int __cpufreq_get(struct cpufreq_policy *policy)
 {
@@ -1819,7 +1836,7 @@ EXPORT_SYMBOL_GPL(cpufreq_get_driver_data);
  *      changes in cpufreq policy.
  *
  *	This function may sleep, and has the same return conditions as
- *	srcu_notifier_chain_register.
+ *	blocking_notifier_chain_register.
  */
 int cpufreq_register_notifier(struct notifier_block *nb, unsigned int list)
 {
@@ -1844,7 +1861,7 @@ int cpufreq_register_notifier(struct notifier_block *nb, unsigned int list)
 		mutex_unlock(&cpufreq_fast_switch_lock);
 		break;
 	case CPUFREQ_POLICY_NOTIFIER:
-		ret = srcu_notifier_chain_register(
+		ret = blocking_notifier_chain_register(
 				&cpufreq_policy_notifier_list, nb);
 		break;
 	default:
@@ -1863,7 +1880,7 @@ EXPORT_SYMBOL(cpufreq_register_notifier);
  *	Remove a driver from the CPU frequency notifier list.
  *
  *	This function may sleep, and has the same return conditions as
- *	srcu_notifier_chain_unregister.
+ *	blocking_notifier_chain_unregister.
  */
 int cpufreq_unregister_notifier(struct notifier_block *nb, unsigned int list)
 {
@@ -1884,7 +1901,7 @@ int cpufreq_unregister_notifier(struct notifier_block *nb, unsigned int list)
 		mutex_unlock(&cpufreq_fast_switch_lock);
 		break;
 	case CPUFREQ_POLICY_NOTIFIER:
-		ret = srcu_notifier_chain_unregister(
+		ret = blocking_notifier_chain_unregister(
 				&cpufreq_policy_notifier_list, nb);
 		break;
 	default:
@@ -1936,12 +1953,10 @@ unsigned int cpufreq_driver_fast_switch(struct cpufreq_policy *policy,
 		return 0;
 
 	policy->cur = freq;
-
-	cpufreq_times_record_transition(policy, freq);
-	cpufreq_stats_record_transition(policy, freq);
-
 	arch_set_freq_scale(policy->related_cpus, freq,
 			    policy->cpuinfo.max_freq);
+	cpufreq_times_record_transition(policy, freq);
+	cpufreq_stats_record_transition(policy, freq);
 
 	if (trace_cpu_frequency_enabled()) {
 		for_each_cpu(cpu, policy->cpus)
@@ -2340,11 +2355,11 @@ static int cpufreq_set_policy(struct cpufreq_policy *policy,
 		return ret;
 
 	/* adjust if necessary - all reasons */
-	srcu_notifier_call_chain(&cpufreq_policy_notifier_list,
+	blocking_notifier_call_chain(&cpufreq_policy_notifier_list,
 			CPUFREQ_ADJUST, new_policy);
 
 	/* the adjusted frequency should not exceed thermal limit*/
-	srcu_notifier_call_chain(&cpufreq_policy_notifier_list,
+	blocking_notifier_call_chain(&cpufreq_policy_notifier_list,
 			CPUFREQ_THERMAL, new_policy);
 
 	/*
@@ -2356,14 +2371,13 @@ static int cpufreq_set_policy(struct cpufreq_policy *policy,
 		return ret;
 
 	/* notification of the new policy */
-	srcu_notifier_call_chain(&cpufreq_policy_notifier_list,
+	blocking_notifier_call_chain(&cpufreq_policy_notifier_list,
 			CPUFREQ_NOTIFY, new_policy);
 
 	policy->min = new_policy->min;
 	policy->max = new_policy->max;
 	trace_cpu_frequency_limits(policy);
 
-	arch_set_max_freq_scale(policy->cpus, policy->max);
 	arch_set_min_freq_scale(policy->related_cpus, policy->min,
 				policy->cpuinfo.max_freq);
 
