@@ -190,7 +190,7 @@ jobs:
           BACK_C: "43"
           TOO_HOT_C: "48"
         run: |
-         cd kernel_tree
+          cd kernel_tree
           cd "$KERNEL_DIR" || { echo "::warning::KERNEL_DIR not found"; exit 0; }
           python3 - <<'PY'
           import os, re, sys
