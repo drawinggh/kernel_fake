@@ -25,10 +25,10 @@ on:
         default: '-Snowfall'
         required: false
       CUSTOM_TIMESTAMP:
-        description: 'Kernel Timestamp. Leave empty to auto-generate (e.g. Tue Nov 2026), or type custom text'
+        description: 'WARNING: Default value is STATIC! Leave empty OR clear it to auto-generate today UTC date, or type custom text.'
         required: false
         type: string
-        default: ''
+        default: 'Tue Oct 2026'
       COMPILER:
         description: 'Choose compiler'
         required: true
@@ -451,8 +451,8 @@ jobs:
           export PATH="$(pwd)/clang/bin:$PATH"
           export ARCH=arm64
           export SUBARCH=ARM64
-          export KBUILD_BUILD_USER="renoroi"
-          export KBUILD_BUILD_HOST="dreamstate"
+          export KBUILD_BUILD_USER="Nahid"
+          export KBUILD_BUILD_HOST="Memoria"
           
           CUSTOM_TIMESTAMP="${{ github.event.inputs.CUSTOM_TIMESTAMP }}"
           
