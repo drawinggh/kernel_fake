@@ -22,7 +22,7 @@ on:
         required: false
       CUSTOM_SED:
         description: 'Custom Kernel Version'
-        default: '-SnowFall'
+        default: '-Snowfall'
         required: false
       COMPILER:
         description: 'Choose compiler'
@@ -186,17 +186,27 @@ jobs:
         shell: bash {0}
         env:
           KERNEL_DIR: "."
-          WARM: "470"
-          BACK: "40"
+          MAX_C: "47"
+          BACK_C: "43"
+          TOO_HOT_C: "48"
         run: |
           cd "$KERNEL_DIR" || { echo "::warning::KERNEL_DIR not found"; exit 0; }
-          export WARM BACK
           python3 - <<'PY'
           import os, re, sys
 
-          WARM = int(os.environ["WARM"])
-          BACK = int(os.environ["BACK"])
+          def tenths(name):
+              return int(round(float(os.environ[name]) * 10))
+
+          MAX = tenths("MAX_C")
+          BACK = tenths("BACK_C")
+          HOT = tenths("TOO_HOT_C")
+          if not (150 < BACK < MAX <= HOT - 10):
+              print("::error::invalid values: need 15 < BACK_C < MAX_C <= TOO_HOT_C - 1")
+              sys.exit(1)
+          HYST = MAX - BACK
+
           Q = "arch/arm64/boot/dts/vendor/qcom/"
+          KC = "drivers/power/supply/qcom_cas/step-chg-jeita.c"
           ok = True
 
           def rd(p):
@@ -207,23 +217,33 @@ jobs:
               with open(p, "w", encoding="utf-8", errors="surrogateescape") as f:
                   f.write(s)
 
-          def fix_ranges(txt, prop):
-              """Extend the '151 <hi>' range to WARM and shift the last range start."""
-              m = re.search(r"(" + re.escape(prop) + r"\s*=\s*<)(.*?)(>;)", txt, re.S)
+          TRI = re.compile(r"(\(?-?\d+\)?)(\s+)(\(?-?\d+\)?)(\s+)(\d+)")
+          def num(t):
+              return int(t.strip("()"))
+
+          def fix_table(txt, prop):
+              m = re.search(r"(" + re.escape(prop) + r"\s*=\s*<)(.*?)(>\s*;)", txt, re.S)
               if not m:
-                  return txt, False
+                  return txt, "FAIL missing"
               body = m.group(2)
-              # 151 <old_hi> <val>
-              b2, n1 = re.subn(r"(\b151\s+)\d+(\s+\d+)", lambda x: x.group(1) + str(WARM) + x.group(2), body, count=1)
-              # last range: <old_lo> 480 <val>  -> (WARM+1) 480 <val>
-              b3, n2 = re.subn(r"\b\d+(\s+480\s+\d+\s*)$", lambda x: str(WARM + 1) + x.group(1), b2.rstrip())
-              if n1 == 0:
-                  return txt, False
-              if n2 == 0:
-                  # fv table in alioth-sun: '151 480 4450000' then '481 580 ...'; keep as is
-                  b3 = b2
-              tail = body[len(body.rstrip()):]
-              return txt[:m.start(2)] + b3 + tail + txt[m.end(2):], True
+              tris = list(TRI.finditer(body))
+              if len(re.findall(r"\(?-?\d+\)?", body)) != 3 * len(tris):
+                  return txt, "FAIL unparsed"
+              tail = [t for t in tris if num(t.group(3)) > 150]
+              if len(tail) < 2:
+                  return txt, "FAIL no-tail"
+              full = num(tail[0].group(5))
+              low = num(tail[-1].group(5))
+              lo0 = num(tail[0].group(1))
+              last_hi = max(num(tail[-1].group(3)), MAX + 10)
+              new = "%d  %d  %d\n\t\t\t\t%d  %d  %d" % (lo0, MAX, full, MAX + 1, last_hi, low)
+              body2 = body[:tail[0].start()] + new + body[tail[-1].end():]
+              info = "ok %d-%d:%d %d-%d:%d" % (lo0, MAX, full, MAX + 1, last_hi, low)
+              return txt[:m.start(2)] + body2 + txt[m.end(2):], info
+
+          def setval(txt, key):
+              return re.subn(r"(" + re.escape(key) + r"\s*=\s*<)\d+(>)",
+                             lambda x: x.group(1) + str(MAX) + x.group(2), txt)
 
           profiles = [
               "fg-gen4-batterydata-apollo-sun-5000mah.dtsi",
@@ -234,60 +254,69 @@ jobs:
           for name in profiles:
               p = Q + name
               if not os.path.isfile(p):
-                  print("::warning::missing", name); ok = False; continue
-              t = rd(p)
-              t, a = fix_ranges(t, "qcom,jeita-fcc-ranges")
-              t, b = fix_ranges(t, "qcom,jeita-fv-ranges")
-              t, c = re.subn(r"(qcom,jeita-warm-th\s*=\s*<)\d+(>)", lambda x: x.group(1) + str(WARM) + x.group(2), t)
-              wr(p, t)
-              print(("OK   " if a and c else "FAIL ") + name, "fcc=%s fv=%s warm=%d" % (a, b, c))
-              if not (a and c):
+                  print("::warning::missing", name)
                   ok = False
+                  continue
+              t = rd(p)
+              t, a = fix_table(t, "qcom,jeita-fcc-ranges")
+              t, b = fix_table(t, "qcom,jeita-fv-ranges")
+              t, c = setval(t, "qcom,jeita-warm-th")
+              t, d = re.subn(r"(qcom,jeita-too-hot\s*=\s*<)\d+(>)",
+                             lambda x: x.group(1) + str(HOT) + x.group(2), t)
+              wr(p, t)
+              good = a.startswith("ok") and b.startswith("ok") and c == 1 and d == 1
+              ok = ok and good
+              print(("OK   " if good else "FAIL ") + name.replace("fg-gen4-batterydata-", ""))
+              print("     fcc:", a, "| fv:", b, "| warm:", c, "| too-hot:", d)
 
           p = Q + "alioth-sm8250.dtsi"
           if os.path.isfile(p):
               t = rd(p)
               for key in ("qcom,chg-warm-th", "mi,qc3-battery-warm-th", "mi,pd-battery-warm-th"):
-                  t, n = re.subn(r"(" + re.escape(key) + r"\s*=\s*<)\d+(>)", lambda x: x.group(1) + str(WARM) + x.group(2), t)
+                  t, n = setval(t, key)
                   print(("OK   " if n else "FAIL ") + key, n)
-                  if not n:
-                      ok = False
+                  ok = ok and n > 0
               wr(p, t)
           else:
-              print("::warning::alioth-sm8250.dtsi missing"); ok = False
+              print("::warning::alioth-sm8250.dtsi missing")
+              ok = False
 
-          c = "drivers/power/supply/qcom_cas/step-chg-jeita.c"
-          if os.path.isfile(c):
-              t = rd(c)
-              # JEITA hysteresis 20 -> BACK for temps above the threshold (fv and fcc)
-              t, n = re.subn(
-                  r"(chip->jeita_fv_config->param\.hysteresis\s*=\s*)20;(\s*\n\s*chip->jeita_fcc_config->param\.hysteresis\s*=\s*)20;(\s*\n\s*\})",
-                  lambda x: x.group(1) + str(BACK) + ";" + x.group(2) + str(BACK) + ";" + x.group(3), t, count=1)
-              print(("OK   " if n else "FAIL ") + "hysteresis 20 -> %d (block near 'temp <= JEITA_HYSTERESIS_TEMP_THRED')" % BACK, n)
-              if not n:
-                  ok = False
-              if "MYBUILD-v3" not in t:
-                  t, m = re.subn(
-                      r"(\n\s*rc = get_val\(chip->jeita_fcc_config->fcc_cfg,)",
-                      '\n\tpr_err("MYBUILD-v3: temp=%d warm=%d fcc_hyst=%d\\n", temp, chip->jeita_warm_th, chip->jeita_fcc_config->param.hysteresis);' + r"\1",
+          if os.path.isfile(KC):
+              t = rd(KC)
+              blk = re.compile(r"(else\s*\{\s*chip->jeita_fv_config->param\.hysteresis\s*=\s*)\d+"
+                               r"(;\s*chip->jeita_fcc_config->param\.hysteresis\s*=\s*)\d+(;)")
+              t, n1 = blk.subn(lambda x: x.group(1) + str(HYST) + x.group(2) + str(HYST) + x.group(3), t, count=1)
+              t, n2 = re.subn(r"(chip->jeita_f(?:cc|v)_config->param\.hysteresis\s*=\s*)20;",
+                              lambda x: x.group(1) + str(HYST) + ";", t)
+              print(("OK   " if n1 else "FAIL ") + "kernel hysteresis block", n1, "| init defaults", n2)
+              ok = ok and n1 > 0
+              if "MYBUILD-v4" not in t:
+                  t, m2 = re.subn(
+                      r"(\n[ \t]*ffc_mode_dis = get_effective_result\(chip->ffc_mode_dis_votable\);)",
+                      r'\1\n\tpr_info_once("MYBUILD-v4: warm=%d fcc_hyst=%d\\n", chip->jeita_warm_th, chip->jeita_fcc_config->param.hysteresis);',
                       t, count=1)
-                  print(("OK   " if m else "FAIL ") + "marker", m)
-                  if not m:
-                      ok = False
-              wr(c, t)
+                  print(("OK   " if m2 else "FAIL ") + "marker", m2)
+                  ok = ok and m2 > 0
+              wr(KC, t)
           else:
-              print("::warning::step-chg-jeita.c missing"); ok = False
+              print("::warning::step-chg-jeita.c missing")
+              ok = False
+
+          for h in ("drivers/power/supply/ti/pd_policy_manager.h", "drivers/power/supply/ti/cp_qc30.h"):
+              if os.path.isfile(h):
+                  t = rd(h)
+                  t, n = re.subn(r"(#define\s+JEITA_HYSTERESIS\s+)\d+",
+                                 lambda x: x.group(1) + str(HYST), t)
+                  wr(h, t)
+                  print("pump hysteresis in", os.path.basename(h), ":", n, "(0 = not defined here)")
 
           print("ALL PATCHES OK" if ok else "::warning::SOME PATCHES FAILED")
           PY
+          rc=$?
           echo "---- verify ----"
-          Q=arch/arm64/boot/dts/vendor/qcom
-          for f in apollo-sun-5000mah alioth-sun-5000mah alioth-FMT-4520mah alioth-GY-4520mah; do
-            echo "== $f"; sed -n '1,25p' $Q/fg-gen4-batterydata-$f.dtsi | grep -nE "jeita-(fcc|fv)-ranges|^\s+(151|471|441|481)|warm-th"
-          done
-          grep -nE "hysteresis = (5|20|40)" drivers/power/supply/qcom_cas/step-chg-jeita.c | sed -n '1,12p'
-          grep -n "MYBUILD-v3" drivers/power/supply/qcom_cas/step-chg-jeita.c
-          exit 0
+          grep -nE "hysteresis *= *[0-9]+;" drivers/power/supply/qcom_cas/step-chg-jeita.c | sed -n '1,8p'
+          grep -n "MYBUILD-v4" drivers/power/supply/qcom_cas/step-chg-jeita.c
+          exit $rc
       - name: Kernel Version
         run: |
           cd kernel_tree
