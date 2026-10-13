@@ -25,8 +25,9 @@ on:
         default: '-Snowfall'
         required: false
       CUSTOM_TIMESTAMP:
-        description: 'Custom Kernel Timestamp (Leave empty for default clean UTC date)'
+        description: 'Kernel Timestamp. Leave empty to auto-generate (e.g. Tue Nov 2026), or type custom text'
         required: false
+        type: string
         default: ''
       COMPILER:
         description: 'Choose compiler'
