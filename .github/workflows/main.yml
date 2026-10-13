@@ -185,13 +185,11 @@ jobs:
       - name: Patch charge profile (before build)
         shell: bash {0}
         env:
-          KERNEL_DIR: "."
           MAX_C: "47"
           BACK_C: "43"
           TOO_HOT_C: "48"
         run: |
-          cd kernel_tree
-          cd "$KERNEL_DIR" || { echo "::warning::KERNEL_DIR not found"; exit 0; }
+          cd kernel_tree || { echo "::error::kernel_tree not found"; exit 1; }
           python3 - <<'PY'
           import os, re, sys
 
@@ -219,6 +217,7 @@ jobs:
                   f.write(s)
 
           TRI = re.compile(r"(\(?-?\d+\)?)(\s+)(\(?-?\d+\)?)(\s+)(\d+)")
+
           def num(t):
               return int(t.strip("()"))
 
@@ -309,9 +308,10 @@ jobs:
                   t, n = re.subn(r"(#define\s+JEITA_HYSTERESIS\s+)\d+",
                                  lambda x: x.group(1) + str(HYST), t)
                   wr(h, t)
-                  print("pump hysteresis in", os.path.basename(h), ":", n, "(0 = not defined here)")
+                  print("pump hysteresis in", os.path.basename(h), ":", n)
 
-          print("ALL PATCHES OK" if ok else "::warning::SOME PATCHES FAILED")
+          print("ALL PATCHES OK" if ok else "::error::SOME PATCHES FAILED")
+          sys.exit(0 if ok else 2)
           PY
           rc=$?
           echo "---- verify ----"
