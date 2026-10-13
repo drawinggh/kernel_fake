@@ -24,6 +24,10 @@ on:
         description: 'Custom Kernel Version'
         default: '-Snowfall'
         required: false
+      CUSTOM_TIMESTAMP:
+        description: 'Custom Kernel Timestamp (Leave empty for default clean UTC date)'
+        required: false
+        default: ''
       COMPILER:
         description: 'Choose compiler'
         required: true
@@ -448,7 +452,14 @@ jobs:
           export SUBARCH=ARM64
           export KBUILD_BUILD_USER="renoroi"
           export KBUILD_BUILD_HOST="dreamstate"
-          export KBUILD_BUILD_TIMESTAMP="$(TZ=UTC-7 date)"
+          
+          CUSTOM_TIMESTAMP="${{ github.event.inputs.CUSTOM_TIMESTAMP }}"
+          
+          if [ -z "$CUSTOM_TIMESTAMP" ]; then
+            export KBUILD_BUILD_TIMESTAMP="$(date -u +'%a %b %Y')"
+          else
+            export KBUILD_BUILD_TIMESTAMP="$CUSTOM_TIMESTAMP"
+          fi
           cd kernel_tree
           make O=out vendor/alioth_defconfig
 
